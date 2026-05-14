@@ -19,7 +19,7 @@ import {
   upsertSession,
   type ChannelSession,
 } from "./sessions";
-import { TelegramPlatform, type InboundMessage, type TelegramRouter } from "./platforms/telegram";
+import { TelegramPlatform, type InboundAttachment, type InboundMessage, type TelegramRouter } from "./platforms/telegram";
 import { DiscordPlatform, type DiscordInbound, type DiscordRouter } from "./platforms/discord";
 import { SlackPlatform, type SlackInbound, type SlackRouter } from "./platforms/slack";
 import { WebServer, type SessionView, type WebDaemonView } from "./web";
@@ -174,7 +174,14 @@ class Daemon {
 
   private async routeSlack(msg: SlackInbound): Promise<void> {
     const isDM = msg.channelType === "im";
-    const key = isDM ? GLOBAL_KEY : `slack:${msg.channelId}`;
+    // v1 parity: messages in a thread get their own session.
+    let key: string;
+    if (isDM) key = GLOBAL_KEY;
+    else if (msg.threadTs && msg.threadTs !== msg.messageTs) {
+      // thread_ts == message_ts on the parent message — that's "starting" the
+      // thread but isn't itself a thread reply yet. Keep parent on the channel.
+      key = `slack:${msg.channelId}:${msg.threadTs}`;
+    } else key = `slack:${msg.channelId}`;
     const replyTo: ReplyTarget = {
       platform: "slack",
       channelId: msg.channelId,
@@ -227,8 +234,9 @@ class Daemon {
     const channel = await this.ensureChannel(key, "global", /*multiparty*/ false);
     if (!channel) return;
     await touchActivity(key);
+    const text = composeWithAttachments(msg.text, msg.attachments);
     await channel.handleIncoming({
-      text: msg.text,
+      text,
       fromLabel: msg.fromName,
       platformMsgId: String(msg.messageId),
       replyTo,
@@ -359,11 +367,26 @@ class Daemon {
   }
 }
 
+function composeWithAttachments(text: string, attachments: InboundAttachment[]): string {
+  if (!attachments.length) return text;
+  const lines: string[] = [];
+  for (const a of attachments) {
+    const bits: string[] = [`Attached ${a.kind}`];
+    if (a.duration !== undefined) bits.push(`${a.duration}s`);
+    if (a.originalName) bits.push(`name=${a.originalName}`);
+    if (a.mimeType) bits.push(`mime=${a.mimeType}`);
+    lines.push(`[${bits.join(" · ")}: ${a.localPath}]`);
+  }
+  if (text) lines.push("", text);
+  return lines.join("\n");
+}
+
 function deriveKindFromKey(
   key: string,
 ): { kind: "global" | "discord" | "slack"; multiparty: boolean } | null {
   if (key === GLOBAL_KEY) return { kind: "global", multiparty: false };
   if (key.startsWith("discord:")) return { kind: "discord", multiparty: true };
+  // slack keys may be "slack:<channelId>" or "slack:<channelId>:<threadTs>".
   if (key.startsWith("slack:")) return { kind: "slack", multiparty: true };
   return null;
 }

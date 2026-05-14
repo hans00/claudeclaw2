@@ -9,9 +9,12 @@
  *
  * Not in scope yet: voice, photos, MarkdownV2, reactions, edited messages.
  */
+import { mkdir, writeFile } from "fs/promises";
+import { join, basename } from "path";
 import type { TelegramConfig } from "../config";
 
 const API_BASE = "https://api.telegram.org";
+const ATTACH_DIR = join(".claude", "claudeclaw", "attachments");
 
 interface TgUser {
   id: number;
@@ -26,12 +29,35 @@ interface TgChat {
   type: "private" | "group" | "supergroup" | "channel";
 }
 
+interface TgPhotoSize {
+  file_id: string;
+  file_unique_id: string;
+  width: number;
+  height: number;
+  file_size?: number;
+}
+
+interface TgFile {
+  file_id: string;
+  duration?: number;
+  mime_type?: string;
+  file_size?: number;
+  file_name?: string;
+}
+
 interface TgMessage {
   message_id: number;
   from?: TgUser;
   chat: TgChat;
   date: number;
   text?: string;
+  caption?: string;
+  photo?: TgPhotoSize[];
+  voice?: TgFile;
+  audio?: TgFile;
+  video?: TgFile;
+  document?: TgFile;
+  sticker?: TgFile;
 }
 
 interface TgUpdate {
@@ -40,13 +66,34 @@ interface TgUpdate {
   edited_message?: TgMessage;
 }
 
+export type InboundAttachmentKind =
+  | "photo"
+  | "voice"
+  | "audio"
+  | "video"
+  | "document"
+  | "sticker";
+
+export interface InboundAttachment {
+  kind: InboundAttachmentKind;
+  /** Path relative to project cwd, e.g. ".claude/claudeclaw/attachments/global/...". */
+  localPath: string;
+  duration?: number;
+  mimeType?: string;
+  fileSize?: number;
+  /** Original filename when telegram provides one (documents). */
+  originalName?: string;
+}
+
 export interface InboundMessage {
   chatId: number;
   chatType: "private" | "group" | "supergroup" | "channel";
   fromUserId: number;
   fromName: string;
+  /** Text body (msg.text OR msg.caption if it was a media message). */
   text: string;
   messageId: number;
+  attachments: InboundAttachment[];
 }
 
 export interface TelegramRouter {
@@ -162,11 +209,15 @@ export class TelegramPlatform implements TelegramSender {
 
   private async handleUpdate(update: TgUpdate): Promise<void> {
     const msg = update.message ?? update.edited_message;
-    if (!msg || !msg.text || !msg.from) return;
+    if (!msg || !msg.from) return;
     if (msg.from.is_bot) return;
 
     const allowed = this.opts.config.allowedUserIds;
     if (allowed.length > 0 && !allowed.includes(msg.from.id)) return;
+
+    const text = (msg.text ?? msg.caption ?? "").trim();
+    const attachments = await this.collectAttachments(msg);
+    if (!text && attachments.length === 0) return; // nothing to forward
 
     const name = [msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ").trim()
       || msg.from.username
@@ -178,11 +229,86 @@ export class TelegramPlatform implements TelegramSender {
         chatType: msg.chat.type,
         fromUserId: msg.from.id,
         fromName: name,
-        text: msg.text,
+        text,
         messageId: msg.message_id,
+        attachments,
       });
     } catch (err) {
       console.error("[telegram] router error:", err);
+    }
+  }
+
+  /** Detect + download any media on the message. Best-effort: a failed
+   *  download logs and is omitted, so a partial set still flows through. */
+  private async collectAttachments(msg: TgMessage): Promise<InboundAttachment[]> {
+    const results: InboundAttachment[] = [];
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+
+    // Photos: pick the largest size (last entry).
+    if (Array.isArray(msg.photo) && msg.photo.length > 0) {
+      const largest = msg.photo[msg.photo.length - 1];
+      const att = await this.downloadById(largest.file_id, "photo", ts, msg.chat.id);
+      if (att) {
+        att.fileSize = largest.file_size;
+        results.push(att);
+      }
+    }
+    const single: Array<[InboundAttachmentKind, TgFile | undefined]> = [
+      ["voice", msg.voice],
+      ["audio", msg.audio],
+      ["video", msg.video],
+      ["document", msg.document],
+      ["sticker", msg.sticker],
+    ];
+    for (const [kind, file] of single) {
+      if (!file) continue;
+      const att = await this.downloadById(file.file_id, kind, ts, msg.chat.id);
+      if (!att) continue;
+      att.duration = file.duration;
+      att.mimeType = file.mime_type;
+      att.fileSize = file.file_size;
+      att.originalName = file.file_name;
+      results.push(att);
+    }
+    return results;
+  }
+
+  private async downloadById(
+    fileId: string,
+    kind: InboundAttachmentKind,
+    ts: string,
+    chatId: number,
+  ): Promise<InboundAttachment | null> {
+    const token = this.opts.config.token;
+    if (!token) return null;
+    try {
+      const meta = await fetch(`${API_BASE}/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`);
+      if (!meta.ok) {
+        console.error(`[telegram] getFile ${meta.status}`);
+        return null;
+      }
+      const metaJson = (await meta.json()) as { ok: boolean; result?: { file_path?: string } };
+      const filePath = metaJson?.result?.file_path;
+      if (!filePath) {
+        console.error(`[telegram] getFile returned no file_path`);
+        return null;
+      }
+      const data = await fetch(`${API_BASE}/file/bot${token}/${filePath}`);
+      if (!data.ok) {
+        console.error(`[telegram] file fetch ${data.status}`);
+        return null;
+      }
+      const buf = new Uint8Array(await data.arrayBuffer());
+      const safeChat = String(chatId).replace(/[^a-zA-Z0-9_-]/g, "_");
+      const dir = join(ATTACH_DIR, safeChat);
+      await mkdir(dir, { recursive: true });
+      const ext = (basename(filePath).match(/\.[a-zA-Z0-9]+$/)?.[0] ?? "").toLowerCase();
+      const localPath = join(dir, `${ts}-${kind}${ext}`);
+      await writeFile(localPath, buf);
+      return { kind, localPath };
+    } catch (err) {
+      console.error(`[telegram] download failed for ${kind} ${fileId}:`, err);
+      return null;
     }
   }
 }

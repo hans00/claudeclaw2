@@ -8,6 +8,7 @@ dist/
 .claude/claudeclaw/sessions.json
 .claude/claudeclaw/inbox/
 .claude/claudeclaw/logs/
+.claude/claudeclaw/attachments/
 
 # Bun
 bun.lock
