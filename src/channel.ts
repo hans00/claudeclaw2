@@ -37,8 +37,9 @@ export type ChannelState = "spawning" | "idle" | "running" | "interrupting";
  * is expected to log such outputs but not post anywhere.
  */
 export type ReplyTarget =
-  | { platform: "telegram"; chatId: number }
-  | { platform: "discord"; channelId: string }
+  | { platform: "telegram"; chatId: number; messageId?: number }
+  | { platform: "discord"; channelId: string; messageId?: string }
+  | { platform: "slack"; channelId: string; threadTs?: string; messageTs?: string }
   | null;
 
 export interface ChannelCallbacks {
@@ -108,6 +109,10 @@ export class Channel {
 
   get tmuxSession(): string {
     return this.opts.session.tmuxSession;
+  }
+
+  get session(): ChannelSession {
+    return this.opts.session;
   }
 
   /**

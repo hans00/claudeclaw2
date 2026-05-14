@@ -10,6 +10,7 @@ import { Channel, type ChannelCallbacks, type ReplyTarget } from "./channel";
 import { loadSettings, type Settings } from "./config";
 import { CronScheduler, type Job } from "./jobs";
 import { backupV1GlobalIfExists, migrateFromV1 } from "./migrate";
+import { extractReactions } from "./reactions";
 import {
   GLOBAL_KEY,
   loadSessions,
@@ -19,12 +20,19 @@ import {
   type ChannelSession,
 } from "./sessions";
 import { TelegramPlatform, type InboundMessage, type TelegramRouter } from "./platforms/telegram";
+import { DiscordPlatform, type DiscordInbound, type DiscordRouter } from "./platforms/discord";
+import { SlackPlatform, type SlackInbound, type SlackRouter } from "./platforms/slack";
+import { WebServer, type SessionView, type WebDaemonView } from "./web";
 
 class Daemon {
   private channels = new Map<string, Channel>();
   private telegram: TelegramPlatform | null = null;
+  private discord: DiscordPlatform | null = null;
+  private slack: SlackPlatform | null = null;
   private cron: CronScheduler | null = null;
+  private web: WebServer | null = null;
   private projectDir = process.cwd();
+  private startedAt = Date.now();
   private shuttingDown = false;
 
   constructor(private settings: Settings) {}
@@ -34,9 +42,46 @@ class Daemon {
     await migrateFromV1();
     await this.restoreSessions();
     await this.startTelegram();
+    await this.startDiscord();
+    await this.startSlack();
     this.startCron();
+    this.startWeb();
     this.installSignalHandlers();
     console.log(`[daemon] ready (project=${this.projectDir})`);
+  }
+
+  private startWeb(): void {
+    const view: WebDaemonView = {
+      projectDir: this.projectDir,
+      startedAt: this.startedAt,
+      listChannels: () => this.snapshotChannels(),
+      resolveChannel: async (target) => {
+        const existing = this.channels.get(target);
+        if (existing) return existing;
+        const meta = deriveKindFromKey(target);
+        if (!meta) return null;
+        return this.ensureChannel(target, meta.kind, meta.multiparty);
+      },
+    };
+    this.web = new WebServer(this.settings.web, view);
+    this.web.start();
+  }
+
+  private snapshotChannels(): SessionView[] {
+    const result: SessionView[] = [];
+    for (const [key, channel] of this.channels.entries()) {
+      const session = channel.session;
+      result.push({
+        channelKey: key,
+        kind: session.kind,
+        sessionId: session.sessionId,
+        multiparty: session.multiparty,
+        state: channel.currentState,
+        createdAt: session.createdAt,
+        lastActivityAt: session.lastActivityAt,
+      });
+    }
+    return result;
   }
 
   private startCron(): void {
@@ -71,8 +116,7 @@ class Daemon {
     }
     console.log(`[daemon] restoring ${keys.length} session(s)...`);
     for (const [key, session] of Object.entries(persisted)) {
-      // MVP: restore global + discord:* entries. Slack arrives later.
-      if (session.kind !== "global" && session.kind !== "discord") continue;
+      if (session.kind !== "global" && session.kind !== "discord" && session.kind !== "slack") continue;
       const channel = this.makeChannel(session);
       this.channels.set(key, channel);
       try {
@@ -100,10 +144,85 @@ class Daemon {
     await this.telegram.start();
   }
 
+  private async startDiscord(): Promise<void> {
+    if (!this.settings.discord.token) {
+      console.log("[daemon] discord disabled (no token)");
+      return;
+    }
+    const router: DiscordRouter = {
+      handleMessage: (msg) => this.routeDiscord(msg),
+    };
+    this.discord = new DiscordPlatform({
+      config: this.settings.discord,
+      router,
+    });
+    await this.discord.start();
+  }
+
+  private async startSlack(): Promise<void> {
+    const { appToken, botToken } = this.settings.slack;
+    if (!appToken || !botToken) {
+      console.log("[daemon] slack disabled (missing tokens)");
+      return;
+    }
+    const router: SlackRouter = {
+      handleMessage: (msg) => this.routeSlack(msg),
+    };
+    this.slack = new SlackPlatform({ config: this.settings.slack, router });
+    await this.slack.start();
+  }
+
+  private async routeSlack(msg: SlackInbound): Promise<void> {
+    const isDM = msg.channelType === "im";
+    const key = isDM ? GLOBAL_KEY : `slack:${msg.channelId}`;
+    const replyTo: ReplyTarget = {
+      platform: "slack",
+      channelId: msg.channelId,
+      threadTs: msg.threadTs,
+      messageTs: msg.messageTs,
+    };
+    const kind = isDM ? "global" : "slack";
+    const multiparty = !isDM;
+    const channel = await this.ensureChannel(key, kind, multiparty);
+    if (!channel) return;
+    await touchActivity(key);
+    await channel.handleIncoming({
+      text: msg.text,
+      fromLabel: msg.fromName,
+      platformMsgId: msg.messageTs,
+      replyTo,
+    });
+  }
+
+  private async routeDiscord(msg: DiscordInbound): Promise<void> {
+    const isDM = msg.guildId === null;
+    const key = isDM ? GLOBAL_KEY : `discord:${msg.channelId}`;
+    const replyTo: ReplyTarget = {
+      platform: "discord",
+      channelId: msg.channelId,
+      messageId: msg.messageId,
+    };
+    const kind = isDM ? "global" : "discord";
+    const multiparty = !isDM;
+    const channel = await this.ensureChannel(key, kind, multiparty);
+    if (!channel) return;
+    await touchActivity(key);
+    await channel.handleIncoming({
+      text: msg.text,
+      fromLabel: msg.fromName,
+      platformMsgId: msg.messageId,
+      replyTo,
+    });
+  }
+
   private async routeTelegram(msg: InboundMessage): Promise<void> {
     // v1 parity: all Telegram traffic (DM + group) lands on "global".
     const key = GLOBAL_KEY;
-    const replyTo: ReplyTarget = { platform: "telegram", chatId: msg.chatId };
+    const replyTo: ReplyTarget = {
+      platform: "telegram",
+      chatId: msg.chatId,
+      messageId: msg.messageId,
+    };
 
     const channel = await this.ensureChannel(key, "global", /*multiparty*/ false);
     if (!channel) return;
@@ -118,7 +237,7 @@ class Daemon {
 
   private async ensureChannel(
     key: string,
-    kind: "global" | "discord",
+    kind: "global" | "discord" | "slack",
     multiparty: boolean,
   ): Promise<Channel | null> {
     let channel = this.channels.get(key);
@@ -172,16 +291,39 @@ class Daemon {
     text: string,
     replyTo: ReplyTarget,
   ): Promise<void> {
+    const { cleanText, reactions } = extractReactions(text);
     if (!replyTo) {
-      console.log(`[daemon] [${session.channelKey}] no replyTo — logging only:\n${text.slice(0, 500)}`);
+      console.log(`[daemon] [${session.channelKey}] no replyTo — logging only:\n${cleanText.slice(0, 500)}`);
+      if (reactions.length) {
+        console.log(`[daemon] [${session.channelKey}] reactions (dropped, no target): ${reactions.join(" ")}`);
+      }
       return;
     }
     try {
       if (replyTo.platform === "telegram") {
         if (!this.telegram) return;
-        await this.telegram.sendMessage(replyTo.chatId, text);
+        if (cleanText) await this.telegram.sendMessage(replyTo.chatId, cleanText);
+        if (replyTo.messageId !== undefined) {
+          for (const emoji of reactions) {
+            await this.telegram.setReaction(replyTo.chatId, replyTo.messageId, emoji);
+          }
+        }
       } else if (replyTo.platform === "discord") {
-        console.warn(`[daemon] discord outbound not implemented yet (chan=${replyTo.channelId})`);
+        if (!this.discord) return;
+        if (cleanText) await this.discord.sendMessage(replyTo.channelId, cleanText);
+        if (replyTo.messageId) {
+          for (const emoji of reactions) {
+            await this.discord.addReaction(replyTo.channelId, replyTo.messageId, emoji);
+          }
+        }
+      } else if (replyTo.platform === "slack") {
+        if (!this.slack) return;
+        if (cleanText) await this.slack.sendMessage(replyTo.channelId, cleanText, replyTo.threadTs);
+        if (replyTo.messageTs) {
+          for (const emoji of reactions) {
+            await this.slack.addReaction(replyTo.channelId, replyTo.messageTs, emoji);
+          }
+        }
       }
     } catch (err) {
       console.error(`[daemon] dispatch failed for ${session.channelKey}:`, err);
@@ -201,7 +343,10 @@ class Daemon {
     this.shuttingDown = true;
     console.log(`[daemon] shutting down (${reason})...`);
     this.cron?.stop();
+    this.web?.stop();
     if (this.telegram) await this.telegram.stop();
+    if (this.discord) await this.discord.stop();
+    if (this.slack) await this.slack.stop();
     // Note: we deliberately do NOT kill tmux sessions on shutdown — they
     // outlive the daemon so context is preserved across restarts. Use
     // `tmux kill-server` or a separate teardown command for full cleanup.
@@ -214,9 +359,12 @@ class Daemon {
   }
 }
 
-function deriveKindFromKey(key: string): { kind: "global" | "discord"; multiparty: boolean } | null {
+function deriveKindFromKey(
+  key: string,
+): { kind: "global" | "discord" | "slack"; multiparty: boolean } | null {
   if (key === GLOBAL_KEY) return { kind: "global", multiparty: false };
   if (key.startsWith("discord:")) return { kind: "discord", multiparty: true };
+  if (key.startsWith("slack:")) return { kind: "slack", multiparty: true };
   return null;
 }
 

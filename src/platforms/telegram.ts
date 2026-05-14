@@ -55,6 +55,7 @@ export interface TelegramRouter {
 
 export interface TelegramSender {
   sendMessage(chatId: number, text: string): Promise<void>;
+  setReaction(chatId: number, messageId: number, emoji: string): Promise<void>;
 }
 
 export interface TelegramOptions {
@@ -92,7 +93,7 @@ export class TelegramPlatform implements TelegramSender {
 
   async sendMessage(chatId: number, text: string): Promise<void> {
     const token = this.opts.config.token;
-    if (!token) return;
+    if (!token || !text) return;
     const chunks = chunkText(text);
     for (const chunk of chunks) {
       const res = await fetch(`${API_BASE}/bot${token}/sendMessage`, {
@@ -105,6 +106,25 @@ export class TelegramPlatform implements TelegramSender {
         console.error(`[telegram] sendMessage failed (${res.status}): ${body.slice(0, 200)}`);
         return;
       }
+    }
+  }
+
+  async setReaction(chatId: number, messageId: number, emoji: string): Promise<void> {
+    const token = this.opts.config.token;
+    if (!token) return;
+    const res = await fetch(`${API_BASE}/bot${token}/setMessageReaction`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+        reaction: [{ type: "emoji", emoji }],
+        is_big: false,
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.error(`[telegram] setMessageReaction failed (${res.status}): ${body.slice(0, 200)}`);
     }
   }
 
