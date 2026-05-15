@@ -280,7 +280,9 @@ export function tailJsonl(
 
       try {
         dirWatcher = watch(parent, (_eventType, filename) => {
-          if (filename === target) void tryStart();
+          // macOS FSEvents may deliver events with filename=null; in that
+          // case fall through and let tryStart() do the stat check anyway.
+          if (!filename || filename === target) void tryStart();
         });
       } catch (err) {
         console.error(`[jsonl] failed to watch parent ${parent}:`, err);
