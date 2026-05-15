@@ -6,11 +6,16 @@
  * existing sessions on startup so daemon restarts don't reset conversations.
  */
 import { randomUUID } from "crypto";
+import { mkdir, unlink, writeFile } from "fs/promises";
+import { dirname, join } from "path";
 import { Channel, type ChannelCallbacks, type ReplyTarget } from "./channel";
 import { loadSettings, type Settings } from "./config";
 import { CronScheduler, type Job } from "./jobs";
+import { HeartbeatScheduler, parseTimezoneOffset } from "./heartbeat";
 import { backupV1GlobalIfExists, migrateFromV1 } from "./migrate";
 import { extractReactions } from "./reactions";
+
+const PID_FILE = join(".claude", "claudeclaw", "daemon.pid");
 import {
   GLOBAL_KEY,
   loadSessions,
@@ -31,6 +36,7 @@ class Daemon {
   private discord: DiscordPlatform | null = null;
   private slack: SlackPlatform | null = null;
   private cron: CronScheduler | null = null;
+  private heartbeat: HeartbeatScheduler | null = null;
   private web: WebServer | null = null;
   private projectDir = process.cwd();
   private startedAt = Date.now();
@@ -39,6 +45,7 @@ class Daemon {
   constructor(private settings: Settings) {}
 
   async start(): Promise<void> {
+    await this.writePidFile();
     await backupV1GlobalIfExists();
     await migrateFromV1();
     await this.restoreSessions();
@@ -46,6 +53,7 @@ class Daemon {
     await this.startDiscord();
     await this.startSlack();
     this.startCron();
+    this.startHeartbeat();
     this.startWeb();
     this.installSignalHandlers();
     console.log(`[daemon] ready (project=${this.projectDir})`);
@@ -85,6 +93,31 @@ class Daemon {
     return result;
   }
 
+  private startHeartbeat(): void {
+    this.heartbeat = new HeartbeatScheduler({
+      config: this.settings.heartbeat,
+      timezoneOffsetMinutes: parseTimezoneOffset(this.settings.timezone),
+      hooks: {
+        fire: async (prompt) => {
+          const channel = await this.ensureChannel(GLOBAL_KEY, "global", false);
+          if (!channel) return false;
+          await channel.handleIncoming({
+            text: prompt,
+            fromLabel: "heartbeat",
+            replyTo: null,
+          });
+          return true;
+        },
+        isBusy: () => {
+          const ch = this.channels.get(GLOBAL_KEY);
+          if (!ch) return false;
+          return ch.currentState === "running" || ch.currentState === "interrupting";
+        },
+      },
+    });
+    this.heartbeat.start();
+  }
+
   private startCron(): void {
     this.cron = new CronScheduler({
       fire: (job) => this.fireCronJob(job),
@@ -106,6 +139,11 @@ class Daemon {
       fromLabel: `cron:${job.name}`,
       replyTo: job.replyTo,
     });
+  }
+
+  private async writePidFile(): Promise<void> {
+    await mkdir(dirname(PID_FILE), { recursive: true });
+    await writeFile(PID_FILE, String(process.pid), "utf8");
   }
 
   private async restoreSessions(): Promise<void> {
@@ -194,6 +232,7 @@ class Daemon {
     const channel = await this.ensureChannel(key, kind, multiparty);
     if (!channel) return;
     await touchActivity(key);
+    if (await this.tryHandleCommand(msg.text, channel, replyTo)) return;
     const text = composePromptWithAttachments(msg.text, msg.attachments);
     await channel.handleIncoming({
       text,
@@ -216,6 +255,7 @@ class Daemon {
     const channel = await this.ensureChannel(key, kind, multiparty);
     if (!channel) return;
     await touchActivity(key);
+    if (await this.tryHandleCommand(msg.text, channel, replyTo)) return;
     const text = composePromptWithAttachments(msg.text, msg.attachments);
     await channel.handleIncoming({
       text,
@@ -237,6 +277,7 @@ class Daemon {
     const channel = await this.ensureChannel(key, "global", /*multiparty*/ false);
     if (!channel) return;
     await touchActivity(key);
+    if (await this.tryHandleCommand(msg.text, channel, replyTo)) return;
     const text = composePromptWithAttachments(msg.text, msg.attachments);
     await channel.handleIncoming({
       text,
@@ -244,6 +285,29 @@ class Daemon {
       platformMsgId: String(msg.messageId),
       replyTo,
     });
+  }
+
+  /**
+   * Handle slash-commands that should not reach the agent. Returns true when
+   * the message was consumed as a command.
+   */
+  private async tryHandleCommand(
+    raw: string,
+    channel: Channel,
+    replyTo: ReplyTarget,
+  ): Promise<boolean> {
+    const cmd = raw.trim();
+    if (cmd === "/stop") {
+      const state = channel.currentState;
+      await channel.userStop();
+      const msg =
+        state === "running"
+          ? "🛑 stopped current turn (queue cleared)"
+          : "🛑 nothing was running; queue cleared if any";
+      await this.dispatchOutbound(channel.session, msg, replyTo);
+      return true;
+    }
+    return false;
   }
 
   private async ensureChannel(
@@ -353,10 +417,12 @@ class Daemon {
     this.shuttingDown = true;
     console.log(`[daemon] shutting down (${reason})...`);
     this.cron?.stop();
+    this.heartbeat?.stop();
     this.web?.stop();
     if (this.telegram) await this.telegram.stop();
     if (this.discord) await this.discord.stop();
     if (this.slack) await this.slack.stop();
+    await unlink(PID_FILE).catch(() => {});
     // Note: we deliberately do NOT kill tmux sessions on shutdown — they
     // outlive the daemon so context is preserved across restarts. Use
     // `tmux kill-server` or a separate teardown command for full cleanup.

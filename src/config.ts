@@ -43,14 +43,30 @@ export interface WebConfig {
   port: number;
 }
 
+export interface HeartbeatWindow {
+  start: string; // "HH:MM"
+  end: string;   // "HH:MM"; if end < start the window wraps midnight
+}
+
+export interface HeartbeatConfig {
+  enabled: boolean;
+  /** Minutes between fires. */
+  interval: number;
+  prompt: string;
+  excludeWindows: HeartbeatWindow[];
+}
+
 export interface Settings {
   telegram: TelegramConfig;
   discord: DiscordConfig;
   slack: SlackConfig;
   web: WebConfig;
+  heartbeat: HeartbeatConfig;
   security: SecurityConfig;
   /** Polling interval for Telegram long-poll, in seconds. Default 25. */
   telegramPollSeconds: number;
+  /** Timezone for heartbeat exclude windows + cron with no override. e.g. "UTC+8". */
+  timezone: string;
 }
 
 const SETTINGS_PATH = join(".claude", "claudeclaw", "settings.json");
@@ -60,8 +76,10 @@ const DEFAULTS: Settings = {
   discord: { token: "", allowedUserIds: [], allowedBotIds: [], channels: {} },
   slack: { appToken: "", botToken: "", allowedUserIds: [], allowedBotIds: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
+  heartbeat: { enabled: false, interval: 60, prompt: "", excludeWindows: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   telegramPollSeconds: 25,
+  timezone: "",
 };
 
 export async function loadSettings(): Promise<Settings> {
@@ -114,8 +132,25 @@ export async function loadSettings(): Promise<Settings> {
         ? raw.security.disallowedTools
         : [],
     },
+    heartbeat: {
+      enabled: typeof raw?.heartbeat?.enabled === "boolean"
+        ? raw.heartbeat.enabled
+        : DEFAULTS.heartbeat.enabled,
+      interval: typeof raw?.heartbeat?.interval === "number"
+        ? raw.heartbeat.interval
+        : DEFAULTS.heartbeat.interval,
+      prompt: typeof raw?.heartbeat?.prompt === "string"
+        ? raw.heartbeat.prompt
+        : DEFAULTS.heartbeat.prompt,
+      excludeWindows: Array.isArray(raw?.heartbeat?.excludeWindows)
+        ? raw.heartbeat.excludeWindows.filter(
+            (w: any) => w && typeof w.start === "string" && typeof w.end === "string",
+          )
+        : DEFAULTS.heartbeat.excludeWindows,
+    },
     telegramPollSeconds: typeof raw?.telegramPollSeconds === "number"
       ? raw.telegramPollSeconds
       : DEFAULTS.telegramPollSeconds,
+    timezone: typeof raw?.timezone === "string" ? raw.timezone : DEFAULTS.timezone,
   };
 }

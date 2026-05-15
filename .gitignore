@@ -9,6 +9,7 @@ dist/
 .claude/claudeclaw/inbox/
 .claude/claudeclaw/logs/
 .claude/claudeclaw/attachments/
+.claude/claudeclaw/daemon.pid
 
 # Bun
 bun.lock

@@ -37,6 +37,30 @@ function dirScopePrompt(projectDir: string): string {
 }
 
 /**
+ * Cron-job schema hint. The agent has Write/Read/Bash natively, so it can
+ * manage scheduled jobs by editing markdown files itself — this just tells
+ * it the expected file format and conventions. Always appended.
+ */
+const CRON_JOBS_HINT = [
+  "## Scheduled jobs",
+  "",
+  "You can schedule recurring or one-shot self-prompts by writing markdown files at `.claude/claudeclaw/jobs/<name>.md`:",
+  "",
+  "```markdown",
+  "---",
+  'schedule: "0 23 * * *"        # 5-field POSIX cron, required',
+  "recurring: true               # default true; false = delete file after firing",
+  'target: "global"              # default "global"; or "discord:<channelId>" / "slack:<channelId>" / "slack:<channelId>:<threadTs>"',
+  'replyTo: "telegram:<chatId>"  # optional outbound sink; without it output is log-only',
+  'timezone: "+08:00"            # optional, default UTC',
+  "---",
+  "<prompt body — what you want yourself to do when fired>",
+  "```",
+  "",
+  "Use Write to create or update, Glob/Read to inspect, Bash `rm` to delete. The cron tick runs every minute; existing jobs are picked up immediately without restart.",
+].join("\n");
+
+/**
  * NO_REPLY rules — appended only for multi-party channels (group chats, public
  * channels). Verbatim port from v1 silent.ts so behaviour stays consistent.
  */
@@ -85,6 +109,7 @@ export async function composeAppendSystemPrompt(opts: ComposeOptions): Promise<s
   if (opts.security.level !== "unrestricted") {
     parts.push(dirScopePrompt(opts.projectDir ?? process.cwd()));
   }
+  parts.push(CRON_JOBS_HINT);
   if (opts.multiparty) parts.push(SILENT_REPLY_PROMPT);
   return parts.join("\n\n");
 }
