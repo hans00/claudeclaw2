@@ -476,6 +476,9 @@ class Daemon {
       onToolUse: async (toolName, input, replyTo) => {
         await this.dispatchOutbound(session, formatToolStatus(toolName, input), replyTo);
       },
+      onTyping: async (replyTo) => {
+        await this.dispatchTyping(replyTo);
+      },
       onError: (err) => {
         console.error(`[channel ${session.channelKey}] error:`, err.message);
       },
@@ -489,6 +492,18 @@ class Daemon {
       agentic: this.settings.agentic,
       timezoneOffsetMinutes: parseTimezoneOffset(this.settings.timezone),
     });
+  }
+
+  private async dispatchTyping(replyTo: ReplyTarget): Promise<void> {
+    if (!replyTo) return;
+    try {
+      if (replyTo.platform === "telegram") await this.telegram?.sendTypingAction(replyTo.chatId);
+      else if (replyTo.platform === "discord") await this.discord?.sendTypingAction(replyTo.channelId);
+      else if (replyTo.platform === "slack") await this.slack?.sendTypingAction(replyTo.channelId);
+      else if (replyTo.platform === "line") await this.line?.sendTypingAction(replyTo.to);
+    } catch (err) {
+      console.error(`[daemon] typing dispatch failed:`, err instanceof Error ? err.message : err);
+    }
   }
 
   private async dispatchOutbound(

@@ -48,6 +48,7 @@ export interface LineRouter {
 export interface LineSender {
   pushText(to: string, text: string): Promise<void>;
   sendReaction(messageId: string, emoji: string): Promise<void>;
+  sendTypingAction(chatId: string): Promise<void>;
 }
 
 export interface LineOptions {
@@ -240,6 +241,20 @@ export class LinePlatform implements LineSender {
         console.error(`[line] pushText failed (${res?.status}): ${body?.slice(0, 200)}`);
         return;
       }
+    }
+  }
+
+  async sendTypingAction(chatId: string): Promise<void> {
+    // LINE has a "loading indicator" endpoint; it animates the three dots
+    // for up to 60s. We invoke it every few seconds so it stays visible
+    // until the turn ends (matches the Telegram/Discord typing cadence).
+    try {
+      await this.api("/bot/chat/loading/start", "POST", {
+        chatId,
+        loadingSeconds: 20,
+      });
+    } catch (err) {
+      console.error(`[line] loading-indicator failed:`, err instanceof Error ? err.message : err);
     }
   }
 

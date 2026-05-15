@@ -41,6 +41,8 @@ export interface SlackRouter {
 export interface SlackSender {
   sendMessage(channelId: string, text: string, threadTs?: string): Promise<void>;
   addReaction(channelId: string, messageTs: string, emoji: string): Promise<void>;
+  /** No-op on Slack — the Bot Web API has no "typing" equivalent. */
+  sendTypingAction(channelId: string): Promise<void>;
 }
 
 export interface SlackOptions {
@@ -238,6 +240,10 @@ export class SlackPlatform implements SlackSender {
         return;
       }
     }
+  }
+
+  async sendTypingAction(_channelId: string): Promise<void> {
+    // Slack does not expose a bot typing indicator; intentional no-op.
   }
 
   async addReaction(channelId: string, messageTs: string, emoji: string): Promise<void> {

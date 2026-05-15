@@ -92,6 +92,7 @@ export interface TelegramRouter {
 export interface TelegramSender {
   sendMessage(chatId: number, text: string): Promise<void>;
   setReactions(chatId: number, messageId: number, emojis: string[]): Promise<void>;
+  sendTypingAction(chatId: number): Promise<void>;
 }
 
 export interface TelegramOptions {
@@ -175,6 +176,21 @@ export class TelegramPlatform implements TelegramSender {
    * (custom emojis, newer additions, etc) is dropped here with a warning
    * rather than burning the whole reaction batch on a 400.
    */
+  async sendTypingAction(chatId: number): Promise<void> {
+    const token = this.opts.config.token;
+    if (!token) return;
+    try {
+      await fetch(`${API_BASE}/bot${token}/sendChatAction`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, action: "typing" }),
+      });
+    } catch (err) {
+      // Non-critical — typing indicator is a UX nicety, swallow errors.
+      console.error(`[telegram] sendChatAction failed:`, err instanceof Error ? err.message : err);
+    }
+  }
+
   async setReactions(chatId: number, messageId: number, emojis: string[]): Promise<void> {
     const token = this.opts.config.token;
     if (!token) return;

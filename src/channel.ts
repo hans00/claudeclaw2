@@ -52,9 +52,17 @@ export interface ChannelCallbacks {
   onToolUse(toolName: string, input: unknown, replyTo: ReplyTarget): Promise<void> | void;
   /** Optional: invoked when the channel becomes idle after a turn ends. */
   onTurnEnd?(): Promise<void> | void;
+  /** Optional: fire a platform "typing…" indicator. Called repeatedly while
+   *  the channel is mid-turn (most platforms time out their indicator after
+   *  ~5–10s, so this gets retriggered until the turn ends). */
+  onTyping?(replyTo: ReplyTarget): Promise<void> | void;
   /** Optional: surface init failures. */
   onError?(err: Error): void;
 }
+
+/** Resend a typing indicator every N ms while the channel is mid-turn.
+ *  Telegram's chat-action expires after 5s, Discord's after ~10s. */
+const TYPING_PULSE_MS = 4000;
 
 export interface SourceInfo {
   platform: "telegram" | "discord" | "slack" | "line";
@@ -208,6 +216,7 @@ export class Channel {
   private queue: QueueItem[] = [];
   private tailer: TailHandle | null = null;
   private interruptTimer: ReturnType<typeof setTimeout> | null = null;
+  private typingTimer: ReturnType<typeof setInterval> | null = null;
   /** Reply target for the in-flight turn. Stays put until next paste. */
   private currentTurnReplyTo: ReplyTarget = null;
   /** The model the running `claude` process believes it's using. Updated on
@@ -340,11 +349,29 @@ export class Channel {
     }
   }
 
+  private startTypingPulse(): void {
+    if (this.typingTimer) return;
+    const fire = () => {
+      const target = this.currentTurnReplyTo;
+      if (!target) return;
+      if (this.state !== "running" && this.state !== "interrupting") return;
+      void this.opts.callbacks.onTyping?.(target);
+    };
+    fire();
+    this.typingTimer = setInterval(fire, TYPING_PULSE_MS);
+  }
+
+  private stopTypingPulse(): void {
+    if (this.typingTimer) clearInterval(this.typingTimer);
+    this.typingTimer = null;
+  }
+
   private onTurnEnd(): void {
     if (this.interruptTimer) {
       clearTimeout(this.interruptTimer);
       this.interruptTimer = null;
     }
+    this.stopTypingPulse();
     this.state = "idle";
     void this.opts.callbacks.onTurnEnd?.();
     void this.drainQueue();
@@ -420,6 +447,7 @@ export class Channel {
     // turn them into ordinary text that claude routes to the model instead
     // of intercepting client-side.
     if (isPassthroughSlashCommand(item.text)) {
+      this.startTypingPulse();
       try {
         await pasteText(target, item.text.trim());
         await new Promise((r) => setTimeout(r, 80));
@@ -427,6 +455,7 @@ export class Channel {
       } catch (err) {
         console.error(`[channel ${this.opts.session.channelKey}] slash paste failed:`, err);
         this.opts.callbacks.onError?.(err as Error);
+        this.stopTypingPulse();
         this.state = "idle";
       }
       return;
@@ -436,6 +465,7 @@ export class Channel {
     const promptBody = this.formatPromptBody(item);
     const full = [inboxText, promptBody].filter(Boolean).join("\n\n");
 
+    this.startTypingPulse();
     try {
       await this.maybeSwitchModel(item.text);
       await pasteText(target, full);
@@ -444,6 +474,7 @@ export class Channel {
     } catch (err) {
       console.error(`[channel ${this.opts.session.channelKey}] paste failed:`, err);
       this.opts.callbacks.onError?.(err as Error);
+      this.stopTypingPulse();
       this.state = "idle";
     }
   }
@@ -514,6 +545,7 @@ export class Channel {
     this.tailer = null;
     if (this.interruptTimer) clearTimeout(this.interruptTimer);
     this.interruptTimer = null;
+    this.stopTypingPulse();
     try {
       await killSession(this.opts.session.tmuxSession);
     } catch {}

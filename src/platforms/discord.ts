@@ -64,6 +64,7 @@ export interface DiscordRouter {
 export interface DiscordSender {
   sendMessage(channelId: string, text: string): Promise<void>;
   addReaction(channelId: string, messageId: string, emoji: string): Promise<void>;
+  sendTypingAction(channelId: string): Promise<void>;
 }
 
 export interface DiscordOptions {
@@ -332,6 +333,14 @@ export class DiscordPlatform implements DiscordSender {
         console.error(`[discord] sendMessage ${res.status}: ${body.slice(0, 200)}`);
         return;
       }
+    }
+  }
+
+  async sendTypingAction(channelId: string): Promise<void> {
+    try {
+      await this.rest("POST", `/channels/${channelId}/typing`);
+    } catch (err) {
+      console.error(`[discord] typing failed:`, err instanceof Error ? err.message : err);
     }
   }
 
