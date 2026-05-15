@@ -10,7 +10,7 @@ import { watch } from "fs";
 import { mkdir, unlink, writeFile } from "fs/promises";
 import { dirname, join } from "path";
 import { Channel, type ChannelCallbacks, type ReplyTarget } from "./channel";
-import { loadSettings, type Settings } from "./config";
+import { loadSettings, type MessageStreamMode, type Settings } from "./config";
 import { CronScheduler, type Job } from "./jobs";
 import { composeHeartbeatPrompt, HeartbeatScheduler, loadHeartbeatTemplate, parseTimezoneOffset } from "./heartbeat";
 import type { SourceInfo } from "./channel";
@@ -621,7 +621,7 @@ class Daemon {
         await this.dispatchReasoning(session, text, replyTo, claudeMsgId);
       },
       onTurnEnd: () => {
-        void this.finalizeTurn(session.channelKey);
+        void this.finalizeTurn(session);
       },
       onTyping: async (replyTo) => {
         await this.dispatchTyping(replyTo);
@@ -780,18 +780,53 @@ class Daemon {
    *               which is implemented as suppress-everything-except-final;
    *               for now we also just delete them)
    */
-  private async finalizeTurn(channelKey: string): Promise<void> {
-    const mode = this.settings.messageStream.mode;
+  private async finalizeTurn(session: ChannelSession): Promise<void> {
+    const channelKey = session.channelKey;
     const previews = this.previews.get(channelKey) ?? [];
     this.previews.delete(channelKey);
     const state = this.outbound.get(channelKey);
     clearOutboundState(state);
     this.outbound.delete(channelKey);
+    if (previews.length === 0) return;
+    // All previews in a turn share the same replyTo, so the first one is
+    // enough to determine the mode.
+    const mode = this.streamMode(previews[0]?.replyTo ?? null);
     if (mode === "keep") return;
     // Delete previews (replace + off both clear previews). Fire and forget.
     for (const p of previews) {
       void this.platformDelete(p.replyTo, p.platformMsgId);
     }
+  }
+
+  /**
+   * Pick the streaming mode for an outbound reply target.
+   *   discord channel → settings.discord.channels[id].messageStream
+   *                  → settings.discord.messageStream
+   *                  → built-in default "off"
+   *   discord DM     → settings.discord.messageStream → "off"
+   *   telegram       → settings.telegram.messageStream → "replace"
+   *   slack          → settings.slack.messageStream → "replace"
+   *   line           → settings.line.messageStream → "replace"
+   *   null replyTo   → "replace" (logging-only path; nothing visible anyway)
+   */
+  private streamMode(replyTo: ReplyTarget): MessageStreamMode {
+    if (!replyTo) return "replace";
+    if (replyTo.platform === "discord") {
+      const ch = this.settings.discord.channels[replyTo.channelId];
+      return ch?.messageStream?.mode
+        ?? this.settings.discord.messageStream?.mode
+        ?? "off";
+    }
+    if (replyTo.platform === "telegram") {
+      return this.settings.telegram.messageStream?.mode ?? "replace";
+    }
+    if (replyTo.platform === "slack") {
+      return this.settings.slack.messageStream?.mode ?? "replace";
+    }
+    if (replyTo.platform === "line") {
+      return this.settings.line.messageStream?.mode ?? "replace";
+    }
+    return "replace";
   }
 
   private async platformDelete(replyTo: ReplyTarget, msgId: string): Promise<boolean> {
@@ -820,7 +855,7 @@ class Daemon {
     replyTo: ReplyTarget,
     claudeMsgId: string | undefined,
   ): Promise<void> {
-    if (this.settings.messageStream.mode === "off") return;
+    if (this.streamMode(replyTo) === "off") return;
     if (!replyTo) {
       console.log(`[daemon] [${session.channelKey}] no replyTo — reasoning: ${text.slice(0, 200)}`);
       return;
@@ -859,7 +894,7 @@ class Daemon {
     result: string,
     replyTo: ReplyTarget,
   ): Promise<void> {
-    if (this.settings.messageStream.mode === "off") return;
+    if (this.streamMode(replyTo) === "off") return;
     if (!replyTo) return;
     const state = this.outbound.get(session.channelKey);
     if (!state || state.kind !== "tool" || !state.platformMsgId) return;
@@ -882,7 +917,7 @@ class Daemon {
     input: unknown,
     replyTo: ReplyTarget,
   ): Promise<void> {
-    if (this.settings.messageStream.mode === "off") return;
+    if (this.streamMode(replyTo) === "off") return;
     const line = formatToolStatus(toolName, input);
     if (!replyTo) {
       console.log(`[daemon] [${session.channelKey}] no replyTo — tool: ${line}`);

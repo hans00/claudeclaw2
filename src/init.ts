@@ -46,19 +46,24 @@ const SETTINGS_TEMPLATE = `{
   },
   "telegram": {
     "token": "",
-    "allowedUserIds": []
+    "allowedUserIds": [],
+    "//": "Per-platform messageStream.mode: replace = delete previews at end_turn (default); keep = leave them; off = no previews",
+    "messageStream": { "mode": "replace" }
   },
   "discord": {
     "token": "",
     "allowedUserIds": [],
     "allowedBotIds": [],
+    "//": "Discord defaults to off so the bot doesn't flood busy public channels with tool-call previews. Per-channel overrides go in channels.<id>.messageStream",
+    "messageStream": { "mode": "off" },
     "channels": {}
   },
   "slack": {
     "appToken": "",
     "botToken": "",
     "allowedUserIds": [],
-    "allowedBotIds": []
+    "allowedBotIds": [],
+    "messageStream": { "mode": "replace" }
   },
   "line": {
     "channelAccessToken": "",
@@ -66,16 +71,13 @@ const SETTINGS_TEMPLATE = `{
     "webhookPath": "/line/webhook",
     "webhookPort": 0,
     "allowedUserIds": [],
-    "allowedGroupIds": []
+    "allowedGroupIds": [],
+    "messageStream": { "mode": "replace" }
   },
   "web": {
     "enabled": true,
     "host": "127.0.0.1",
     "port": 4632
-  },
-  "messageStream": {
-    "//": "replace = delete reasoning/tool previews at end_turn (default); keep = leave them; off = suppress previews entirely",
-    "mode": "replace"
   },
   "security": {
     "level": "moderate",

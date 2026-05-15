@@ -8,15 +8,37 @@ import { readFile } from "fs/promises";
 import { join } from "path";
 import type { SecurityConfig } from "./compose";
 
+/**
+ * How to surface in-progress reasoning / tool calls during a turn vs. the
+ * final answer at end_turn.
+ *
+ *   "replace" — show previews during the turn, delete them at end_turn so
+ *               only the final bubble remains
+ *   "keep"    — leave previews visible after end_turn
+ *   "off"     — no previews at all; only the final text is sent
+ *
+ * Built-in defaults per platform: telegram=replace, discord=off (busy rooms
+ * default), slack=replace, line=replace.
+ */
+export type MessageStreamMode = "replace" | "keep" | "off";
+
+export interface MessageStreamConfig {
+  mode: MessageStreamMode;
+}
+
 export interface TelegramConfig {
   token: string;
   allowedUserIds: number[];
+  /** Default messageStream mode for Telegram. Built-in default: "replace". */
+  messageStream?: MessageStreamConfig;
 }
 
 export interface DiscordChannelConfig {
   enabled: boolean;
   requireMention: boolean;
   ignoreOtherMentions: boolean;
+  /** Per-channel override; takes precedence over discord.messageStream. */
+  messageStream?: MessageStreamConfig;
 }
 
 export interface DiscordConfig {
@@ -24,6 +46,9 @@ export interface DiscordConfig {
   allowedUserIds: string[];
   allowedBotIds: string[];
   channels: Record<string, DiscordChannelConfig>;
+  /** Default messageStream mode for Discord. Built-in default: "off" so the
+   *  bot doesn't flood busy public channels with tool-call previews. */
+  messageStream?: MessageStreamConfig;
 }
 
 export interface LineConfig {
@@ -36,6 +61,9 @@ export interface LineConfig {
   /** Allowed user ids (Slack `U...`-style strings). Empty = allow all. */
   allowedUserIds: string[];
   allowedGroupIds: string[];
+  /** Default messageStream mode for LINE. Note: LINE has no edit/delete
+   *  endpoint, so "replace" effectively behaves like "keep" anyway. */
+  messageStream?: MessageStreamConfig;
 }
 
 export interface SlackConfig {
@@ -47,27 +75,14 @@ export interface SlackConfig {
   allowedUserIds: string[];
   /** Allowed bot ids (Slack B... ids). */
   allowedBotIds: string[];
+  /** Default messageStream mode for Slack. Built-in default: "replace". */
+  messageStream?: MessageStreamConfig;
 }
 
 export interface WebConfig {
   enabled: boolean;
   host: string;
   port: number;
-}
-
-/**
- * How to surface in-progress reasoning / tool calls during a turn vs. the
- * final answer at end_turn.
- *
- *   "replace" (default) — show previews during the turn, delete them at
- *                          end_turn so only the final bubble remains
- *   "keep"             — leave previews visible after end_turn too
- *   "off"              — no previews at all; only the final text is sent
- */
-export type MessageStreamMode = "replace" | "keep" | "off";
-
-export interface MessageStreamConfig {
-  mode: MessageStreamMode;
 }
 
 export interface HeartbeatWindow {
@@ -102,7 +117,6 @@ export interface Settings {
   slack: SlackConfig;
   line: LineConfig;
   web: WebConfig;
-  messageStream: MessageStreamConfig;
   heartbeat: HeartbeatConfig;
   security: SecurityConfig;
   /** Default model (alias like "opus"/"sonnet" or full id). Empty = let Claude Code pick. */
@@ -130,7 +144,6 @@ const DEFAULTS: Settings = {
     allowedGroupIds: [],
   },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
-  messageStream: { mode: "replace" },
   heartbeat: { enabled: false, interval: 60, prompt: "", excludeWindows: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   model: "",
@@ -138,6 +151,12 @@ const DEFAULTS: Settings = {
   telegramPollSeconds: 25,
   timezone: "",
 };
+
+function parseStreamCfg(raw: any): MessageStreamConfig | undefined {
+  const m = raw?.mode;
+  if (m === "replace" || m === "keep" || m === "off") return { mode: m };
+  return undefined;
+}
 
 export async function loadSettings(): Promise<Settings> {
   let raw: any;
@@ -156,6 +175,7 @@ export async function loadSettings(): Promise<Settings> {
       allowedUserIds: Array.isArray(raw?.telegram?.allowedUserIds)
         ? raw.telegram.allowedUserIds.filter((x: unknown) => typeof x === "number")
         : DEFAULTS.telegram.allowedUserIds,
+      messageStream: parseStreamCfg(raw?.telegram?.messageStream),
     },
     discord: {
       token: raw?.discord?.token ?? DEFAULTS.discord.token,
@@ -165,7 +185,24 @@ export async function loadSettings(): Promise<Settings> {
       allowedBotIds: Array.isArray(raw?.discord?.allowedBotIds)
         ? raw.discord.allowedBotIds.filter((x: unknown) => typeof x === "string")
         : DEFAULTS.discord.allowedBotIds,
-      channels: raw?.discord?.channels ?? DEFAULTS.discord.channels,
+      channels: (() => {
+        const out: Record<string, DiscordChannelConfig> = {};
+        const src = raw?.discord?.channels;
+        if (src && typeof src === "object") {
+          for (const [id, cfg] of Object.entries(src)) {
+            if (!cfg || typeof cfg !== "object") continue;
+            const c = cfg as any;
+            out[id] = {
+              enabled: !!c.enabled,
+              requireMention: !!c.requireMention,
+              ignoreOtherMentions: !!c.ignoreOtherMentions,
+              messageStream: parseStreamCfg(c.messageStream),
+            };
+          }
+        }
+        return out;
+      })(),
+      messageStream: parseStreamCfg(raw?.discord?.messageStream),
     },
     slack: {
       appToken: raw?.slack?.appToken ?? DEFAULTS.slack.appToken,
@@ -176,6 +213,7 @@ export async function loadSettings(): Promise<Settings> {
       allowedBotIds: Array.isArray(raw?.slack?.allowedBotIds)
         ? raw.slack.allowedBotIds.filter((x: unknown) => typeof x === "string")
         : DEFAULTS.slack.allowedBotIds,
+      messageStream: parseStreamCfg(raw?.slack?.messageStream),
     },
     line: {
       channelAccessToken: raw?.line?.channelAccessToken ?? DEFAULTS.line.channelAccessToken,
@@ -192,17 +230,12 @@ export async function loadSettings(): Promise<Settings> {
       allowedGroupIds: Array.isArray(raw?.line?.allowedGroupIds)
         ? raw.line.allowedGroupIds.filter((x: unknown) => typeof x === "string")
         : DEFAULTS.line.allowedGroupIds,
+      messageStream: parseStreamCfg(raw?.line?.messageStream),
     },
     web: {
       enabled: typeof raw?.web?.enabled === "boolean" ? raw.web.enabled : DEFAULTS.web.enabled,
       host: typeof raw?.web?.host === "string" ? raw.web.host : DEFAULTS.web.host,
       port: typeof raw?.web?.port === "number" ? raw.web.port : DEFAULTS.web.port,
-    },
-    messageStream: {
-      mode: (() => {
-        const m = raw?.messageStream?.mode;
-        return m === "replace" || m === "keep" || m === "off" ? m : DEFAULTS.messageStream.mode;
-      })(),
     },
     security: {
       level: raw?.security?.level ?? DEFAULTS.security.level,
