@@ -327,34 +327,126 @@ export class TelegramPlatform implements TelegramSender {
  *
  * What we translate:
  *   - ```` ```lang\nblock``` ```` → `<pre>block</pre>`
+ *   - markdown tables (`| col | col |` rows + `|---|---|` separator) →
+ *     monospace `<pre>` with cells column-padded
  *   - `` `inline` `` → `<code>inline</code>`
  *   - `## heading` (any depth) → `<b>heading</b>`
  *   - `**bold**` → `<b>bold</b>`
  *   - everything else → HTML-escaped plaintext
  *
- * Tables, lists, links and italics are intentionally left as escaped
- * literal text — they survive readably and never break the HTML parser.
+ * Lists, italics and links are intentionally left as escaped literal text
+ * — they read fine and never break the HTML parser.
  */
 export function markdownToTelegramHtml(md: string): string {
   const blocks: string[] = [];
+  const stash = (html: string): string => {
+    blocks.push(html);
+    return `\x00BLOCK${blocks.length - 1}\x00`;
+  };
+
+  // 1. Fenced code blocks — verbatim contents.
   let s = md.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, _lang, code) => {
-    const idx = blocks.length;
     const trimmed = code.replace(/\n$/, "");
-    blocks.push(`<pre>${escapeHtml(trimmed)}</pre>`);
-    return `\x00BLOCK${idx}\x00`;
+    return stash(`<pre>${escapeHtml(trimmed)}</pre>`);
   });
+
+  // 2. Markdown tables — re-render with padded columns inside <pre> so
+  //    the cells line up under Telegram's monospace font. We require the
+  //    canonical "header / |---|---| / body rows" shape.
+  s = s.replace(
+    /(^\|[^\n]+\|[ \t]*\n\|[-:\s|]+\|[ \t]*\n(?:\|[^\n]+\|[ \t]*\n?)+)/gm,
+    (block) => {
+      const lines = block.trimEnd().split("\n");
+      if (lines.length < 2) return block;
+      const rows: string[][] = [];
+      for (let i = 0; i < lines.length; i++) {
+        if (i === 1) continue; // separator
+        rows.push(parseTableRow(lines[i]));
+      }
+      return stash(`<pre>${escapeHtml(formatTableAligned(rows))}</pre>`);
+    },
+  );
+
+  // 3. Inline code.
   const inlines: string[] = [];
   s = s.replace(/`([^`\n]+)`/g, (_, code) => {
-    const idx = inlines.length;
     inlines.push(`<code>${escapeHtml(code)}</code>`);
-    return `\x00INLINE${idx}\x00`;
+    return `\x00INLINE${inlines.length - 1}\x00`;
   });
+
+  // 4. Escape the rest, then apply inline formatting on the escaped text.
   s = escapeHtml(s);
   s = s.replace(/^(#{1,6})\s+(.+)$/gm, (_, _h, txt) => `<b>${txt}</b>`);
   s = s.replace(/\*\*([^\n]+?)\*\*/g, "<b>$1</b>");
+
   s = s.replace(/\x00INLINE(\d+)\x00/g, (_, n) => inlines[Number(n)] ?? "");
   s = s.replace(/\x00BLOCK(\d+)\x00/g, (_, n) => blocks[Number(n)] ?? "");
   return s;
+}
+
+function parseTableRow(line: string): string[] {
+  const t = line.trim();
+  // Strip leading/trailing pipes then split.
+  const inner = t.replace(/^\|/, "").replace(/\|$/, "");
+  return inner.split("|").map((c) => c.trim());
+}
+
+function formatTableAligned(rows: string[][]): string {
+  if (rows.length === 0) return "";
+  const cols = Math.max(...rows.map((r) => r.length));
+  const widths = new Array(cols).fill(0);
+  for (const row of rows) {
+    for (let j = 0; j < row.length; j++) {
+      const w = visibleWidth(row[j]);
+      if (w > widths[j]) widths[j] = w;
+    }
+  }
+  const sep = "  ";
+  const out: string[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const padded = row.map((cell, j) => padToWidth(cell, widths[j]));
+    out.push(padded.join(sep));
+    if (i === 0) {
+      // header underline using the same widths
+      out.push(widths.map((w) => "─".repeat(w)).join(sep));
+    }
+  }
+  return out.join("\n");
+}
+
+/** Width counting CJK chars as 2 (so monospace alignment looks right). */
+function visibleWidth(s: string): number {
+  let w = 0;
+  for (const ch of s) {
+    const code = ch.codePointAt(0) ?? 0;
+    w += isWide(code) ? 2 : 1;
+  }
+  return w;
+}
+
+function padToWidth(s: string, target: number): string {
+  const w = visibleWidth(s);
+  if (w >= target) return s;
+  return s + " ".repeat(target - w);
+}
+
+function isWide(code: number): boolean {
+  return (
+    (code >= 0x1100 && code <= 0x115f) ||  // Hangul Jamo
+    (code >= 0x2e80 && code <= 0x303e) ||  // CJK Radicals + Kangxi
+    (code >= 0x3041 && code <= 0x33ff) ||  // Hiragana + Katakana + CJK Symbols
+    (code >= 0x3400 && code <= 0x4dbf) ||  // CJK Ext A
+    (code >= 0x4e00 && code <= 0x9fff) ||  // CJK Unified
+    (code >= 0xa000 && code <= 0xa4cf) ||  // Yi Syllables
+    (code >= 0xac00 && code <= 0xd7a3) ||  // Hangul Syllables
+    (code >= 0xf900 && code <= 0xfaff) ||  // CJK Compat
+    (code >= 0xfe30 && code <= 0xfe4f) ||  // CJK Compat Forms
+    (code >= 0xff00 && code <= 0xff60) ||  // Fullwidth ASCII
+    (code >= 0xffe0 && code <= 0xffe6) ||  // Fullwidth signs
+    (code >= 0x20000 && code <= 0x2fffd) ||// CJK Ext B-F
+    (code >= 0x30000 && code <= 0x3fffd)
+  );
 }
 
 function escapeHtml(s: string): string {
