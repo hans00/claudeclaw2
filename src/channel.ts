@@ -42,6 +42,7 @@ export type ReplyTarget =
   | { platform: "telegram"; chatId: number; messageId?: number }
   | { platform: "discord"; channelId: string; messageId?: string }
   | { platform: "slack"; channelId: string; threadTs?: string; messageTs?: string }
+  | { platform: "line"; to: string; messageId?: string }
   | null;
 
 export interface ChannelCallbacks {

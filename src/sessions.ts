@@ -10,7 +10,7 @@
 import { mkdir, readFile, rename, writeFile } from "fs/promises";
 import { dirname, join } from "path";
 
-export type ChannelKind = "global" | "telegram" | "discord" | "slack";
+export type ChannelKind = "global" | "telegram" | "discord" | "slack" | "line";
 
 /** The cross-platform DM sink. All Telegram + Discord DMs route here. */
 export const GLOBAL_KEY = "global";

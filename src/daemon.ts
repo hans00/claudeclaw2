@@ -29,6 +29,7 @@ import { TelegramPlatform, type InboundMessage, type TelegramRouter } from "./pl
 import { composePromptWithAttachments } from "./attachments";
 import { DiscordPlatform, type DiscordInbound, type DiscordRouter } from "./platforms/discord";
 import { SlackPlatform, type SlackInbound, type SlackRouter } from "./platforms/slack";
+import { LinePlatform, type LineInbound, type LineRouter } from "./platforms/line";
 import { WebServer, type SessionView, type WebDaemonView } from "./web";
 
 class Daemon {
@@ -36,6 +37,7 @@ class Daemon {
   private telegram: TelegramPlatform | null = null;
   private discord: DiscordPlatform | null = null;
   private slack: SlackPlatform | null = null;
+  private line: LinePlatform | null = null;
   private cron: CronScheduler | null = null;
   private heartbeat: HeartbeatScheduler | null = null;
   private statusline: StatuslineWriter | null = null;
@@ -54,6 +56,7 @@ class Daemon {
     await this.startTelegram();
     await this.startDiscord();
     await this.startSlack();
+    await this.startLine();
     this.startCron();
     this.startHeartbeat();
     this.startStatusline();
@@ -105,7 +108,7 @@ class Daemon {
         telegram: !!this.telegram,
         discord: !!this.discord,
         slack: !!this.slack,
-        line: false,
+        line: !!this.line,
       }),
     });
     this.statusline.start();
@@ -173,7 +176,12 @@ class Daemon {
     }
     console.log(`[daemon] restoring ${keys.length} session(s)...`);
     for (const [key, session] of Object.entries(persisted)) {
-      if (session.kind !== "global" && session.kind !== "discord" && session.kind !== "slack") continue;
+      if (
+        session.kind !== "global" &&
+        session.kind !== "discord" &&
+        session.kind !== "slack" &&
+        session.kind !== "line"
+      ) continue;
       const channel = this.makeChannel(session);
       this.channels.set(key, channel);
       try {
@@ -214,6 +222,42 @@ class Daemon {
       router,
     });
     await this.discord.start();
+  }
+
+  private async startLine(): Promise<void> {
+    const c = this.settings.line;
+    if (!c.channelAccessToken || !c.channelSecret || c.webhookPort <= 0) {
+      console.log("[daemon] line disabled (no tokens or webhookPort=0)");
+      return;
+    }
+    const router: LineRouter = {
+      handleMessage: (msg) => this.routeLine(msg),
+    };
+    this.line = new LinePlatform({ config: c, router });
+    await this.line.start();
+  }
+
+  private async routeLine(msg: LineInbound): Promise<void> {
+    const isDM = msg.sourceType === "user";
+    const key = isDM ? GLOBAL_KEY : `line:${msg.sourceId}`;
+    const replyTo: ReplyTarget = {
+      platform: "line",
+      to: msg.sourceId,
+      messageId: msg.messageId,
+    };
+    const kind = isDM ? "global" : "line";
+    const multiparty = !isDM;
+    const channel = await this.ensureChannel(key, kind, multiparty);
+    if (!channel) return;
+    await touchActivity(key);
+    if (await this.tryHandleCommand(msg.text, channel, replyTo)) return;
+    const text = composePromptWithAttachments(msg.text, msg.attachments);
+    await channel.handleIncoming({
+      text,
+      fromLabel: msg.fromName,
+      platformMsgId: msg.messageId,
+      replyTo,
+    });
   }
 
   private async startSlack(): Promise<void> {
@@ -330,7 +374,7 @@ class Daemon {
 
   private async ensureChannel(
     key: string,
-    kind: "global" | "discord" | "slack",
+    kind: "global" | "discord" | "slack" | "line",
     multiparty: boolean,
   ): Promise<Channel | null> {
     let channel = this.channels.get(key);
@@ -418,6 +462,14 @@ class Daemon {
             await this.slack.addReaction(replyTo.channelId, replyTo.messageTs, emoji);
           }
         }
+      } else if (replyTo.platform === "line") {
+        if (!this.line) return;
+        if (cleanText) await this.line.pushText(replyTo.to, cleanText);
+        if (replyTo.messageId) {
+          for (const emoji of reactions) {
+            await this.line.sendReaction(replyTo.messageId, emoji);
+          }
+        }
       }
     } catch (err) {
       console.error(`[daemon] dispatch failed for ${session.channelKey}:`, err);
@@ -443,6 +495,7 @@ class Daemon {
     if (this.telegram) await this.telegram.stop();
     if (this.discord) await this.discord.stop();
     if (this.slack) await this.slack.stop();
+    if (this.line) await this.line.stop();
     await unlink(PID_FILE).catch(() => {});
     // Note: we deliberately do NOT kill tmux sessions on shutdown — they
     // outlive the daemon so context is preserved across restarts. Use
@@ -458,11 +511,11 @@ class Daemon {
 
 function deriveKindFromKey(
   key: string,
-): { kind: "global" | "discord" | "slack"; multiparty: boolean } | null {
+): { kind: "global" | "discord" | "slack" | "line"; multiparty: boolean } | null {
   if (key === GLOBAL_KEY) return { kind: "global", multiparty: false };
   if (key.startsWith("discord:")) return { kind: "discord", multiparty: true };
-  // slack keys may be "slack:<channelId>" or "slack:<channelId>:<threadTs>".
   if (key.startsWith("slack:")) return { kind: "slack", multiparty: true };
+  if (key.startsWith("line:")) return { kind: "line", multiparty: true };
   return null;
 }
 

@@ -26,6 +26,18 @@ export interface DiscordConfig {
   channels: Record<string, DiscordChannelConfig>;
 }
 
+export interface LineConfig {
+  channelAccessToken: string;
+  channelSecret: string;
+  /** Path on the webhook server. Default "/line/webhook". */
+  webhookPath: string;
+  /** Port the LINE webhook server binds to. Set to 0 to disable. */
+  webhookPort: number;
+  /** Allowed user ids (Slack `U...`-style strings). Empty = allow all. */
+  allowedUserIds: string[];
+  allowedGroupIds: string[];
+}
+
 export interface SlackConfig {
   /** xapp-... token for Socket Mode. */
   appToken: string;
@@ -73,6 +85,7 @@ export interface Settings {
   telegram: TelegramConfig;
   discord: DiscordConfig;
   slack: SlackConfig;
+  line: LineConfig;
   web: WebConfig;
   heartbeat: HeartbeatConfig;
   security: SecurityConfig;
@@ -92,6 +105,14 @@ const DEFAULTS: Settings = {
   telegram: { token: "", allowedUserIds: [] },
   discord: { token: "", allowedUserIds: [], allowedBotIds: [], channels: {} },
   slack: { appToken: "", botToken: "", allowedUserIds: [], allowedBotIds: [] },
+  line: {
+    channelAccessToken: "",
+    channelSecret: "",
+    webhookPath: "/line/webhook",
+    webhookPort: 0,
+    allowedUserIds: [],
+    allowedGroupIds: [],
+  },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   heartbeat: { enabled: false, interval: 60, prompt: "", excludeWindows: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
@@ -138,6 +159,22 @@ export async function loadSettings(): Promise<Settings> {
       allowedBotIds: Array.isArray(raw?.slack?.allowedBotIds)
         ? raw.slack.allowedBotIds.filter((x: unknown) => typeof x === "string")
         : DEFAULTS.slack.allowedBotIds,
+    },
+    line: {
+      channelAccessToken: raw?.line?.channelAccessToken ?? DEFAULTS.line.channelAccessToken,
+      channelSecret: raw?.line?.channelSecret ?? DEFAULTS.line.channelSecret,
+      webhookPath: typeof raw?.line?.webhookPath === "string"
+        ? raw.line.webhookPath
+        : DEFAULTS.line.webhookPath,
+      webhookPort: typeof raw?.line?.webhookPort === "number"
+        ? raw.line.webhookPort
+        : DEFAULTS.line.webhookPort,
+      allowedUserIds: Array.isArray(raw?.line?.allowedUserIds)
+        ? raw.line.allowedUserIds.filter((x: unknown) => typeof x === "string")
+        : DEFAULTS.line.allowedUserIds,
+      allowedGroupIds: Array.isArray(raw?.line?.allowedGroupIds)
+        ? raw.line.allowedGroupIds.filter((x: unknown) => typeof x === "string")
+        : DEFAULTS.line.allowedGroupIds,
     },
     web: {
       enabled: typeof raw?.web?.enabled === "boolean" ? raw.web.enabled : DEFAULTS.web.enabled,
