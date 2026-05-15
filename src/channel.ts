@@ -53,6 +53,12 @@ export interface ChannelCallbacks {
   onAssistantText(text: string, replyTo: ReplyTarget, claudeMsgId?: string): Promise<void> | void;
   /** Post a tool-call status indicator (e.g. "🛠 Bash: echo hi"). */
   onToolUse(toolName: string, input: unknown, replyTo: ReplyTarget): Promise<void> | void;
+  /** Append a tool execution result preview under the current tool bubble.
+   *  Skipped when there's no active tool bubble. */
+  onToolResult?(toolUseId: string | undefined, result: string, replyTo: ReplyTarget): Promise<void> | void;
+  /** Post / extend a reasoning ("thinking") bubble for the agent's
+   *  visible deliberation before tool calls or the final answer. */
+  onReasoning?(text: string, replyTo: ReplyTarget, claudeMsgId?: string): Promise<void> | void;
   /** Optional: invoked when the channel becomes idle after a turn ends. */
   onTurnEnd?(): Promise<void> | void;
   /** Optional: fire a platform "typing…" indicator. Called repeatedly while
@@ -337,6 +343,16 @@ export class Channel {
             await this.opts.callbacks.onToolUse(ev.toolName, ev.toolInput, this.currentTurnReplyTo);
           }
           break;
+        case "assistant-thinking":
+          if (ev.text && ev.text.trim() && this.opts.callbacks.onReasoning) {
+            await this.opts.callbacks.onReasoning(ev.text, this.currentTurnReplyTo, ev.msgId);
+          }
+          break;
+        case "user-tool-result":
+          if (ev.toolResult && this.opts.callbacks.onToolResult) {
+            await this.opts.callbacks.onToolResult(ev.toolUseId, ev.toolResult, this.currentTurnReplyTo);
+          }
+          break;
         case "user-message": {
           if (!ev.userText) break;
           const cls = classifyInternalOutput(ev.userText);
@@ -364,7 +380,7 @@ export class Channel {
         case "turn-end":
           this.onTurnEnd();
           break;
-        // Skipped: assistant-thinking, user-tool-result, system, unknown
+        // Skipped: system, unknown
       }
     } catch (err) {
       console.error(`[channel ${this.opts.session.channelKey}] event handler error:`, err);

@@ -608,6 +608,12 @@ class Daemon {
       onToolUse: async (toolName, input, replyTo) => {
         await this.dispatchToolUse(session, toolName, input, replyTo);
       },
+      onToolResult: async (toolUseId, result, replyTo) => {
+        await this.dispatchToolResult(session, toolUseId, result, replyTo);
+      },
+      onReasoning: async (text, replyTo, claudeMsgId) => {
+        await this.dispatchReasoning(session, text, replyTo, claudeMsgId);
+      },
       onTurnEnd: () => {
         const state = this.outbound.get(session.channelKey);
         // Flush any pending throttled edit synchronously so the final
@@ -748,6 +754,62 @@ class Daemon {
   ): Promise<void> {
     // No-op for now: replyTo isn't kept in OutboundState. The throttle
     // timer (if not yet fired) will deliver the latest text shortly.
+  }
+
+  /**
+   * Reasoning ("thinking") bubble. Shown before tool calls / final answer
+   * when the model emits visible deliberation. Same edit-in-place + throttle
+   * semantics as text/tool bubbles.
+   */
+  private async dispatchReasoning(
+    session: ChannelSession,
+    text: string,
+    replyTo: ReplyTarget,
+    claudeMsgId: string | undefined,
+  ): Promise<void> {
+    if (!replyTo) {
+      console.log(`[daemon] [${session.channelKey}] no replyTo — reasoning: ${text.slice(0, 200)}`);
+      return;
+    }
+    const line = formatReasoningLine(text);
+    if (!line) return;
+    const state = this.outbound.get(session.channelKey);
+    const sameBubble = state?.kind === "reasoning" &&
+      !!claudeMsgId && state.claudeMsgId === claudeMsgId &&
+      !!state.platformMsgId;
+    if (sameBubble && state) {
+      state.accumulated = line;
+      const ok = await this.editWithThrottle(state, replyTo, line);
+      if (ok) return;
+      clearOutboundState(state);
+    }
+    if (state) clearOutboundState(state);
+    const newId = await this.platformSend(replyTo, line);
+    this.outbound.set(
+      session.channelKey,
+      freshOutboundState("reasoning", claudeMsgId, newId, line),
+    );
+  }
+
+  /**
+   * Append a truncated tool-result preview under the current tool bubble,
+   * indented to make the call → result relationship visible. No-op when
+   * there's no active tool bubble.
+   */
+  private async dispatchToolResult(
+    session: ChannelSession,
+    _toolUseId: string | undefined,
+    result: string,
+    replyTo: ReplyTarget,
+  ): Promise<void> {
+    if (!replyTo) return;
+    const state = this.outbound.get(session.channelKey);
+    if (!state || state.kind !== "tool" || !state.platformMsgId) return;
+    const preview = formatToolResultPreview(result);
+    if (!preview) return;
+    const combined = `${state.accumulated}\n  ↳ ${preview}`;
+    state.accumulated = combined;
+    await this.editWithThrottle(state, replyTo, combined);
   }
 
   /**
@@ -912,9 +974,9 @@ class Daemon {
 }
 
 interface OutboundState {
-  /** Whether the current bubble is collecting assistant text or tool-call
-   *  status lines — switching kinds starts a fresh bubble. */
-  kind: "text" | "tool";
+  /** Whether the current bubble is collecting assistant text, tool-call
+   *  status lines, or reasoning — switching kinds starts a fresh bubble. */
+  kind: "text" | "tool" | "reasoning";
   /** Claude Code message.id whose segments we're accumulating. Only set
    *  for text bubbles (tool bubbles accumulate across msg_ids within a turn). */
   claudeMsgId: string | undefined;
@@ -936,7 +998,7 @@ interface OutboundState {
 const EDIT_THROTTLE_MS = 1000;
 
 function freshOutboundState(
-  kind: "text" | "tool",
+  kind: "text" | "tool" | "reasoning",
   claudeMsgId: string | undefined,
   platformMsgId: string | undefined,
   accumulated: string,
@@ -957,6 +1019,33 @@ function clearOutboundState(s: OutboundState | undefined): void {
   if (s.pendingTimer) clearTimeout(s.pendingTimer);
   s.pendingTimer = null;
   s.pendingText = null;
+}
+
+const REASONING_MAX_CHARS = 700;
+const TOOL_RESULT_MAX_LINES = 4;
+const TOOL_RESULT_MAX_CHARS = 280;
+
+function formatReasoningLine(text: string): string {
+  const cleaned = text.trim();
+  if (!cleaned) return "";
+  const truncated = cleaned.length <= REASONING_MAX_CHARS
+    ? cleaned
+    : cleaned.slice(0, REASONING_MAX_CHARS - 1) + "…";
+  return `💭 _Reasoning_\n${truncated}`;
+}
+
+function formatToolResultPreview(result: string): string {
+  const trimmed = result.trim();
+  if (!trimmed) return "";
+  const lines = trimmed.split("\n").slice(0, TOOL_RESULT_MAX_LINES);
+  let joined = lines.join("\n  ↳ ");
+  if (lines.length === TOOL_RESULT_MAX_LINES && trimmed.split("\n").length > TOOL_RESULT_MAX_LINES) {
+    joined += "\n  ↳ …";
+  }
+  if (joined.length > TOOL_RESULT_MAX_CHARS) {
+    joined = joined.slice(0, TOOL_RESULT_MAX_CHARS - 1) + "…";
+  }
+  return joined;
 }
 
 function deriveKindFromKey(
