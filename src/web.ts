@@ -89,7 +89,9 @@ export class WebServer {
       const sessMatch = req.method === "GET" && path.startsWith("/sessions/");
       if (sessMatch) {
         const key = decodeURIComponent(path.slice("/sessions/".length));
-        return this.html(await this.renderTranscript(key));
+        const limitParam = url.searchParams.get("limit");
+        const limit = limitParam ? Math.max(1, Math.min(5000, Number(limitParam) || 200)) : 200;
+        return this.html(await this.renderTranscript(key, limit));
       }
 
       if (req.method === "GET" && path === "/api/status") {
@@ -193,7 +195,7 @@ export class WebServer {
     );
   }
 
-  private async renderTranscript(channelKey: string): Promise<string> {
+  private async renderTranscript(channelKey: string, limit: number): Promise<string> {
     const events = await this.transcriptEvents(channelKey);
     if (!events) {
       return layout(
@@ -201,8 +203,11 @@ export class WebServer {
         `<p><a href="/">← home</a></p><p>session not found for <code>${esc(channelKey)}</code></p>`,
       );
     }
+    const total = events.length;
+    const sliced = events.slice(Math.max(0, total - limit));
+    const truncated = total - sliced.length;
     const blocks: string[] = [];
-    for (const ev of events) {
+    for (const ev of sliced) {
       const time = ev.timestamp ? esc(ev.timestamp.slice(11, 19)) : "";
       switch (ev.type) {
         case "user-message":
@@ -232,11 +237,25 @@ export class WebServer {
           break;
       }
     }
+    const keyEnc = encodeURIComponent(channelKey);
+    const nextLimit = limit < total ? Math.min(total, limit * 2) : null;
+    const navParts: string[] = [
+      `${total} events`,
+      truncated > 0 ? `showing latest ${sliced.length} (${truncated} earlier hidden)` : `showing all`,
+    ];
+    const links: string[] = [];
+    if (nextLimit && nextLimit > limit) {
+      links.push(`<a href="/sessions/${keyEnc}?limit=${nextLimit}">load earlier (${nextLimit})</a>`);
+    }
+    if (limit < total) {
+      links.push(`<a href="/sessions/${keyEnc}?limit=${total}">show all ${total}</a>`);
+    }
+    links.push(`<a href="/api/sessions/${keyEnc}/transcript">JSON</a>`);
     return layout(
       `transcript ${channelKey}`,
       `<p><a href="/">← home</a></p>
 <h1>${esc(channelKey)}</h1>
-<p class="dim">${events.length} events · scroll to bottom for newest</p>
+<p class="dim">${navParts.join(" · ")} · ${links.join(" · ")}</p>
 <div class="transcript">${blocks.join("\n")}</div>`,
     );
   }
@@ -262,26 +281,39 @@ export class WebServer {
   }
 
   private async renderLogsList(): Promise<string> {
-    let entries: string[] = [];
+    const MAX = 50;
+    let names: string[] = [];
     try {
-      entries = (await readdir(LOGS_DIR)).filter((n) => n.endsWith(".log"));
+      names = (await readdir(LOGS_DIR)).filter((n) => n.endsWith(".log"));
     } catch {}
-    const rows = await Promise.all(
-      entries.map(async (n) => {
+    // Sort by mtime desc — newest first.
+    const stats = await Promise.all(
+      names.map(async (n) => {
         const p = join(LOGS_DIR, n);
-        let size = "?";
         try {
           const s = await stat(p);
-          size = formatBytes(s.size);
-        } catch {}
-        return `<tr><td><a href="/logs/${encodeURIComponent(n)}">${esc(n)}</a></td><td>${size}</td></tr>`;
+          return { n, size: s.size, mtime: s.mtimeMs };
+        } catch {
+          return { n, size: 0, mtime: 0 };
+        }
       }),
     );
+    stats.sort((a, b) => b.mtime - a.mtime);
+    const shown = stats.slice(0, MAX);
+    const hidden = stats.length - shown.length;
+    const rows = shown.map(
+      ({ n, size, mtime }) => {
+        const when = mtime ? new Date(mtime).toISOString().slice(0, 19).replace("T", " ") : "?";
+        return `<tr><td><a href="/logs/${encodeURIComponent(n)}">${esc(n)}</a></td><td>${formatBytes(size)}</td><td class="dim">${when}</td></tr>`;
+      },
+    );
+    const footer = hidden > 0 ? `<p class="dim">${hidden} older log file(s) not shown</p>` : "";
     return layout(
       "logs",
       `<p><a href="/">← home</a></p><h1>logs</h1>
-<table><thead><tr><th>file</th><th>size</th></tr></thead>
-<tbody>${rows.join("\n") || `<tr><td colspan="2"><em>(no logs yet)</em></td></tr>`}</tbody></table>`,
+<table><thead><tr><th>file</th><th>size</th><th>mtime</th></tr></thead>
+<tbody>${rows.join("\n") || `<tr><td colspan="3"><em>(no logs yet)</em></td></tr>`}</tbody></table>
+${footer}`,
     );
   }
 
