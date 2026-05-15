@@ -6,7 +6,8 @@
  * existing sessions on startup so daemon restarts don't reset conversations.
  */
 import { randomUUID } from "crypto";
-import { mkdir, unlink, writeFile } from "fs/promises";
+import { mkdir, readFile, stat, unlink, writeFile } from "fs/promises";
+import { homedir } from "os";
 import { dirname, join } from "path";
 import { Channel, type ChannelCallbacks, type ReplyTarget } from "./channel";
 import { loadSettings, type Settings } from "./config";
@@ -352,6 +353,14 @@ class Daemon {
   /**
    * Handle slash-commands that should not reach the agent. Returns true when
    * the message was consumed as a command.
+   *
+   * Why this exists: Claude Code's UI-only slash commands (/context, /status,
+   * /clear, ...) operate on the local TUI and never write to the session
+   * jsonl. Pasting them into tmux works — the TUI panel updates — but the
+   * daemon never sees the response, so nothing gets posted to the platform.
+   * For those we render an equivalent summary from daemon state ourselves.
+   * Skill commands and other model-bound slash commands DO write jsonl when
+   * they fire, so they pass through unchanged.
    */
   private async tryHandleCommand(
     raw: string,
@@ -369,7 +378,92 @@ class Daemon {
       await this.dispatchOutbound(channel.session, msg, replyTo);
       return true;
     }
+    if (cmd === "/context") {
+      const msg = await this.summarizeContext(channel);
+      await this.dispatchOutbound(channel.session, msg, replyTo);
+      return true;
+    }
+    if (cmd === "/status") {
+      const msg = this.summarizeStatus(channel);
+      await this.dispatchOutbound(channel.session, msg, replyTo);
+      return true;
+    }
     return false;
+  }
+
+  private async summarizeContext(channel: Channel): Promise<string> {
+    const s = channel.session;
+    const encoded = this.projectDir.replace(/\//g, "-");
+    const jsonlPath = join(homedir(), ".claude", "projects", encoded, `${s.sessionId}.jsonl`);
+    let totalEntries = 0;
+    let userTurns = 0;
+    let assistantText = 0;
+    let toolUses = 0;
+    let sizeBytes = 0;
+    try {
+      const st = await stat(jsonlPath);
+      sizeBytes = st.size;
+      const raw = await readFile(jsonlPath, "utf8");
+      for (const line of raw.split("\n")) {
+        if (!line.trim()) continue;
+        totalEntries++;
+        try {
+          const e = JSON.parse(line);
+          if (e.type === "user" && e.message?.role === "user") userTurns++;
+          else if (e.type === "assistant" && e.message?.role === "assistant" && Array.isArray(e.message.content)) {
+            for (const c of e.message.content) {
+              if (c?.type === "text") assistantText++;
+              else if (c?.type === "tool_use") toolUses++;
+            }
+          }
+        } catch {}
+      }
+    } catch {
+      return `📊 context · ${s.channelKey}\nno jsonl yet (session has produced no entries)`;
+    }
+    const sizeStr = sizeBytes < 1024 * 1024
+      ? `${(sizeBytes / 1024).toFixed(1)} KB`
+      : `${(sizeBytes / 1024 / 1024).toFixed(1)} MB`;
+    const createdAge = ageString(s.createdAt);
+    const lastAge = ageString(s.lastActivityAt);
+    return [
+      `📊 context · ${s.channelKey}`,
+      `session   ${s.sessionId.slice(0, 8)} (created ${createdAge}, last active ${lastAge})`,
+      `jsonl     ${sizeStr} · ${totalEntries} entries`,
+      `turns     ${userTurns} user · ${assistantText} text · ${toolUses} tool calls`,
+      `state     ${channel.currentState}`,
+    ].join("\n");
+  }
+
+  private summarizeStatus(channel: Channel): string {
+    const uptimeSec = Math.round((Date.now() - this.startedAt) / 1000);
+    const uptimeStr = uptimeSec < 60
+      ? `${uptimeSec}s`
+      : uptimeSec < 3600
+        ? `${Math.floor(uptimeSec / 60)}m`
+        : `${Math.floor(uptimeSec / 3600)}h ${Math.floor((uptimeSec % 3600) / 60)}m`;
+    let running = 0;
+    for (const ch of this.channels.values()) {
+      if (ch.currentState === "running") running++;
+    }
+    const s = channel.session;
+    const platforms: string[] = [];
+    if (this.telegram) platforms.push("telegram");
+    if (this.discord) platforms.push("discord");
+    if (this.slack) platforms.push("slack");
+    if (this.line) platforms.push("line");
+    return [
+      `🦞 claudeclaw v2`,
+      `daemon    pid ${process.pid} · up ${uptimeStr}`,
+      `platforms ${platforms.join(", ") || "(none)"}`,
+      `channels  ${this.channels.size} (${running} running)`,
+      ``,
+      `this channel`,
+      `  key     ${s.channelKey}`,
+      `  kind    ${s.kind}${s.multiparty ? " · multiparty" : ""}`,
+      `  state   ${channel.currentState}`,
+      `  session ${s.sessionId.slice(0, 8)}`,
+    ].join("\n");
   }
 
   private async ensureChannel(
@@ -507,6 +601,16 @@ class Daemon {
     }
     process.exit(0);
   }
+}
+
+function ageString(iso: string): string {
+  const then = Date.parse(iso);
+  if (!Number.isFinite(then)) return iso;
+  const ms = Date.now() - then;
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s ago`;
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m ago`;
+  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h ago`;
+  return `${Math.round(ms / 86_400_000)}d ago`;
 }
 
 function deriveKindFromKey(
