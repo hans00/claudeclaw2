@@ -85,6 +85,14 @@ export interface WebConfig {
   port: number;
 }
 
+export interface ApprovalConfig {
+  /** Master switch — when off, permission dialogs in tmux just hang. */
+  enabled: boolean;
+  /** How long to wait for an operator response before auto-cancelling
+   *  (sending Esc to the tmux dialog). */
+  timeoutSeconds: number;
+}
+
 export interface SessionCleanupConfig {
   /** Channel sessions idle longer than this get their tmux + agent torn
    *  down. The sessions.json entry stays, so the next inbound restores
@@ -126,6 +134,7 @@ export interface Settings {
   slack: SlackConfig;
   line: LineConfig;
   web: WebConfig;
+  approval: ApprovalConfig;
   sessionCleanup: SessionCleanupConfig;
   heartbeat: HeartbeatConfig;
   security: SecurityConfig;
@@ -154,6 +163,7 @@ const DEFAULTS: Settings = {
     allowedGroupIds: [],
   },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
+  approval: { enabled: true, timeoutSeconds: 300 },
   sessionCleanup: { idleTimeoutHours: 168, checkIntervalMinutes: 30 },
   heartbeat: { enabled: false, interval: 60, prompt: "", excludeWindows: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
@@ -255,6 +265,14 @@ export async function loadSettings(): Promise<Settings> {
       checkIntervalMinutes: typeof raw?.sessionCleanup?.checkIntervalMinutes === "number"
         ? raw.sessionCleanup.checkIntervalMinutes
         : DEFAULTS.sessionCleanup.checkIntervalMinutes,
+    },
+    approval: {
+      enabled: typeof raw?.approval?.enabled === "boolean"
+        ? raw.approval.enabled
+        : DEFAULTS.approval.enabled,
+      timeoutSeconds: typeof raw?.approval?.timeoutSeconds === "number"
+        ? raw.approval.timeoutSeconds
+        : DEFAULTS.approval.timeoutSeconds,
     },
     security: {
       level: raw?.security?.level ?? DEFAULTS.security.level,

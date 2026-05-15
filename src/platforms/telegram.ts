@@ -66,10 +66,18 @@ interface TgMessage {
   sticker?: TgFile;
 }
 
+interface TgCallbackQuery {
+  id: string;
+  from: TgUser;
+  message?: { message_id: number; chat: TgChat };
+  data?: string;
+}
+
 interface TgUpdate {
   update_id: number;
   message?: TgMessage;
   edited_message?: TgMessage;
+  callback_query?: TgCallbackQuery;
 }
 
 export interface InboundMessage {
@@ -85,8 +93,24 @@ export interface InboundMessage {
   attachments: InboundAttachment[];
 }
 
+export interface TelegramCallbackInbound {
+  callbackQueryId: string;
+  fromUserId: number;
+  fromName: string;
+  data: string;
+}
+
 export interface TelegramRouter {
   handleMessage(msg: InboundMessage): Promise<void>;
+  /** Inline-keyboard button press. The platform implementation MUST call
+   *  `answerCallbackQuery` itself (best within ~3s) — we forward the raw
+   *  data here so the daemon can route by token. */
+  handleCallback?(cb: TelegramCallbackInbound): Promise<void>;
+}
+
+export interface InlineKeyboardButton {
+  text: string;
+  callback_data: string;
 }
 
 export interface TelegramSender {
@@ -98,6 +122,14 @@ export interface TelegramSender {
   editMessage(chatId: number, messageId: string, text: string): Promise<boolean>;
   /** Delete a previously-sent message. Returns true on success. */
   deleteMessage(chatId: number, messageId: string): Promise<boolean>;
+  /** Send a message with inline keyboard. Returns message_id. */
+  sendInlineKeyboard(
+    chatId: number,
+    text: string,
+    buttons: InlineKeyboardButton[][],
+  ): Promise<string | undefined>;
+  /** Ack a callback_query. Telegram requires this within ~3 seconds. */
+  answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void>;
   setReactions(chatId: number, messageId: number, emojis: string[]): Promise<void>;
   sendTypingAction(chatId: number): Promise<void>;
 }
@@ -214,6 +246,54 @@ export class TelegramPlatform implements TelegramSender {
    * (custom emojis, newer additions, etc) is dropped here with a warning
    * rather than burning the whole reaction batch on a 400.
    */
+  async sendInlineKeyboard(
+    chatId: number,
+    text: string,
+    buttons: InlineKeyboardButton[][],
+  ): Promise<string | undefined> {
+    const token = this.opts.config.token;
+    if (!token) return undefined;
+    const html = markdownToTelegramHtml(text);
+    const chunks = chunkHtml(html, TG_HTML_LIMIT);
+    if (chunks.length === 0) return undefined;
+    const res = await fetch(`${API_BASE}/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: chunks[0],
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: buttons },
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.error(`[telegram] sendInlineKeyboard failed (${res.status}): ${body.slice(0, 200)}`);
+      return undefined;
+    }
+    const data: any = await res.json().catch(() => null);
+    const id = data?.result?.message_id;
+    return typeof id === "number" ? String(id) : undefined;
+  }
+
+  async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
+    const token = this.opts.config.token;
+    if (!token) return;
+    try {
+      await fetch(`${API_BASE}/bot${token}/answerCallbackQuery`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          callback_query_id: callbackQueryId,
+          ...(text ? { text, show_alert: false } : {}),
+        }),
+      });
+    } catch (err) {
+      console.error(`[telegram] answerCallbackQuery failed:`, err);
+    }
+  }
+
   async deleteMessage(chatId: number, messageId: string): Promise<boolean> {
     const token = this.opts.config.token;
     if (!token) return false;
@@ -305,6 +385,30 @@ export class TelegramPlatform implements TelegramSender {
   }
 
   private async handleUpdate(update: TgUpdate): Promise<void> {
+    if (update.callback_query) {
+      const cb = update.callback_query;
+      if (!cb.from || !cb.data) return;
+      const allowed = this.opts.config.allowedUserIds;
+      if (allowed.length > 0 && !allowed.includes(cb.from.id)) {
+        // Reject silently — don't even ack.
+        return;
+      }
+      const name = [cb.from.first_name, cb.from.last_name].filter(Boolean).join(" ").trim()
+        || cb.from.username
+        || String(cb.from.id);
+      try {
+        await this.opts.router.handleCallback?.({
+          callbackQueryId: cb.id,
+          fromUserId: cb.from.id,
+          fromName: name,
+          data: cb.data,
+        });
+      } catch (err) {
+        console.error("[telegram] callback router error:", err);
+      }
+      return;
+    }
+
     const msg = update.message ?? update.edited_message;
     if (!msg || !msg.from) return;
     if (msg.from.is_bot) return;

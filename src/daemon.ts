@@ -33,7 +33,10 @@ import {
   type SessionMap,
 } from "./sessions";
 import { renameSession } from "./tmux";
-import { TelegramPlatform, type InboundMessage, type TelegramRouter } from "./platforms/telegram";
+import { TelegramPlatform, type InboundMessage, type TelegramCallbackInbound, type TelegramRouter } from "./platforms/telegram";
+import { randomBytes } from "crypto";
+import type { ApprovalApi } from "./channel";
+import type { PermissionDialog } from "./approval";
 import { composePromptWithAttachments } from "./attachments";
 import { DiscordPlatform, type DiscordInbound, type DiscordRouter } from "./platforms/discord";
 import { SlackPlatform, type SlackInbound, type SlackRouter } from "./platforms/slack";
@@ -42,6 +45,10 @@ import { WebServer, type SessionView, type WebDaemonView } from "./web";
 
 class Daemon {
   private channels = new Map<string, Channel>();
+  /** Permission dialogs waiting on operator decision. Keyed by short token
+   *  embedded in the inline-keyboard callback_data so we can route incoming
+   *  button presses back to the right channel's tmux session. */
+  private pendingApprovals = new Map<string, PendingApproval>();
   /** Per-channel outbound state for edit-in-place: while consecutive
    *  assistant-text events share the same Claude msg_id, we keep editing
    *  the same platform message instead of sending each segment as its own
@@ -400,6 +407,7 @@ class Daemon {
     }
     const router: TelegramRouter = {
       handleMessage: (msg) => this.routeTelegram(msg),
+      handleCallback: (cb) => this.handleTelegramCallback(cb),
     };
     this.telegram = new TelegramPlatform({
       config: this.settings.telegram,
@@ -688,6 +696,9 @@ class Daemon {
 
   private makeChannel(session: ChannelSession): Channel {
     const callbacks: ChannelCallbacks = {
+      onApprovalNeeded: async (dialog, replyTo, api) => {
+        await this.handleApprovalNeeded(session, dialog, replyTo, api);
+      },
       onAssistantText: async (text, replyTo, claudeMsgId, stopReason) => {
         await this.dispatchAssistantText(session, text, replyTo, claudeMsgId, stopReason);
       },
@@ -899,6 +910,132 @@ class Daemon {
     // Delete previews (replace + off both clear previews). Fire and forget.
     for (const p of previews) {
       void this.platformDelete(p.replyTo, p.platformMsgId);
+    }
+  }
+
+  /**
+   * Route a permission dialog to the operator's DM with inline buttons,
+   * then wait for their decision (or timeout) before sending the
+   * corresponding keypress sequence into tmux.
+   *
+   * Currently Telegram-only — other platforms log + auto-cancel.
+   */
+  private async handleApprovalNeeded(
+    session: ChannelSession,
+    dialog: PermissionDialog,
+    replyTo: ReplyTarget,
+    api: ApprovalApi,
+  ): Promise<void> {
+    const cfg = this.settings.approval;
+    if (!cfg.enabled) {
+      console.warn(`[approval] disabled — cancelling dialog for ${session.channelKey}`);
+      await api.cancel();
+      return;
+    }
+
+    // Resolve DM target. Route to the originating platform's owner DM where
+    // possible. Discord/Slack/LINE not yet wired — fall back to auto-cancel.
+    let telegramChatId: number | undefined;
+    if (replyTo?.platform === "telegram") {
+      telegramChatId = replyTo.chatId;
+    } else if (this.settings.telegram.allowedUserIds.length > 0) {
+      telegramChatId = this.settings.telegram.allowedUserIds[0];
+    }
+
+    if (telegramChatId === undefined || !this.telegram) {
+      console.warn(
+        `[approval] no Telegram approver configured for ${session.channelKey} — auto-cancelling.`,
+      );
+      await api.cancel();
+      return;
+    }
+
+    const token = randomBytes(6).toString("hex");
+    const buttons = dialog.options.map((opt, i) => [{
+      text: numberedButtonLabel(i + 1, opt),
+      callback_data: `ap:${token}:${i + 1}`,
+    }]);
+    buttons.push([{ text: "❌ Cancel (Esc)", callback_data: `ap:${token}:0` }]);
+
+    const body = formatApprovalPrompt(session.channelKey, dialog);
+    const msgId = await this.telegram.sendInlineKeyboard(telegramChatId, body, buttons);
+    if (!msgId) {
+      console.warn(`[approval] sendInlineKeyboard failed for ${session.channelKey} — auto-cancelling`);
+      await api.cancel();
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      void this.resolveApproval(token, null);
+    }, cfg.timeoutSeconds * 1000);
+
+    this.pendingApprovals.set(token, {
+      session,
+      api,
+      dialog,
+      platform: "telegram",
+      chatId: telegramChatId,
+      platformMsgId: msgId,
+      timer,
+      bodyBase: body,
+    });
+
+    console.log(`[approval] ${session.channelKey} prompt sent (token ${token})`);
+  }
+
+  private async handleTelegramCallback(cb: TelegramCallbackInbound): Promise<void> {
+    const m = cb.data.match(/^ap:([a-f0-9]+):(\d+)$/);
+    if (!m) {
+      await this.telegram?.answerCallbackQuery(cb.callbackQueryId, "Unknown action");
+      return;
+    }
+    const token = m[1];
+    const choice = Number(m[2]);
+    const pending = this.pendingApprovals.get(token);
+    if (!pending) {
+      await this.telegram?.answerCallbackQuery(cb.callbackQueryId, "Expired");
+      return;
+    }
+    await this.telegram?.answerCallbackQuery(cb.callbackQueryId);
+    await this.resolveApproval(token, choice, cb.fromName);
+  }
+
+  private async resolveApproval(
+    token: string,
+    choice: number | null,
+    actor?: string,
+  ): Promise<void> {
+    const pending = this.pendingApprovals.get(token);
+    if (!pending) return;
+    this.pendingApprovals.delete(token);
+    clearTimeout(pending.timer);
+
+    try {
+      if (choice === null) {
+        await pending.api.cancel();
+        await this.telegram?.editMessage(
+          pending.chatId,
+          pending.platformMsgId,
+          `⏰ _Timed out — cancelled_\n\n${pending.bodyBase}`,
+        );
+      } else if (choice === 0) {
+        await pending.api.cancel();
+        await this.telegram?.editMessage(
+          pending.chatId,
+          pending.platformMsgId,
+          `❌ _Cancelled by ${actor ?? "user"}_\n\n${pending.bodyBase}`,
+        );
+      } else {
+        const label = pending.dialog.options[choice - 1] ?? `option ${choice}`;
+        await pending.api.selectOption(choice);
+        await this.telegram?.editMessage(
+          pending.chatId,
+          pending.platformMsgId,
+          `✅ _Picked "${label}" by ${actor ?? "user"}_\n\n${pending.bodyBase}`,
+        );
+      }
+    } catch (err) {
+      console.error(`[approval] resolve ${token} failed:`, err);
     }
   }
 
@@ -1194,6 +1331,40 @@ interface ProgressContent {
   items: ProgressItem[];
   /** Result preview for the LAST tool call only; cleared on each new tool. */
   lastResult: string;
+}
+
+interface PendingApproval {
+  session: ChannelSession;
+  api: ApprovalApi;
+  dialog: PermissionDialog;
+  platform: "telegram";
+  chatId: number;
+  platformMsgId: string;
+  timer: ReturnType<typeof setTimeout>;
+  /** The body we initially posted, kept so we can prepend the outcome
+   *  line during the final edit. */
+  bodyBase: string;
+}
+
+function numberedButtonLabel(n: number, text: string): string {
+  // Telegram inline-keyboard buttons render best as a single line. Truncate
+  // long option text so it fits on a button without wrapping.
+  const max = 50;
+  const truncated = text.length <= max ? text : text.slice(0, max - 1) + "…";
+  return `${n}. ${truncated}`;
+}
+
+function formatApprovalPrompt(channelKey: string, dialog: PermissionDialog): string {
+  const lines: string[] = [
+    `🔐 _Permission needed_ · \`${channelKey}\``,
+    "",
+  ];
+  if (dialog.question) {
+    lines.push("```");
+    lines.push(dialog.question);
+    lines.push("```");
+  }
+  return lines.join("\n");
 }
 
 interface OutboundState {

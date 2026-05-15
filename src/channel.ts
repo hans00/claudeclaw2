@@ -11,6 +11,7 @@
 import { homedir } from "os";
 import { join } from "path";
 import type { AgenticConfig } from "./config";
+import { parsePermissionDialog, type PermissionDialog } from "./approval";
 import { buildClaudeArgs, type SecurityConfig } from "./compose";
 import { drainInbox, formatInboxForPrompt } from "./inbox";
 import { type JsonlEvent, tailJsonl, type TailHandle } from "./jsonl";
@@ -69,7 +70,26 @@ export interface ChannelCallbacks {
   onTyping?(replyTo: ReplyTarget): Promise<void> | void;
   /** Optional: surface init failures. */
   onError?(err: Error): void;
+  /** Optional: a Claude Code permission dialog is visible in the pane.
+   *  Daemon should route to the trusted approver and reply via `selectOption`
+   *  (1-indexed) or `cancel()` (Esc). */
+  onApprovalNeeded?(
+    dialog: PermissionDialog,
+    replyTo: ReplyTarget,
+    api: ApprovalApi,
+  ): Promise<void> | void;
 }
+
+export interface ApprovalApi {
+  /** Send the (1-indexed) option choice into the tmux session. */
+  selectOption(index: number): Promise<void>;
+  /** Cancel the dialog (Esc). */
+  cancel(): Promise<void>;
+}
+
+/** Poll the pane this often while the channel is running, looking for
+ *  a permission dialog blocking the agent. */
+const APPROVAL_POLL_MS = 1500;
 
 /** Resend a typing indicator every N ms while the channel is mid-turn.
  *  Telegram's chat-action expires after 5s, Discord's after ~10s. */
@@ -231,6 +251,11 @@ export class Channel {
   private tailer: TailHandle | null = null;
   private interruptTimer: ReturnType<typeof setTimeout> | null = null;
   private typingTimer: ReturnType<typeof setInterval> | null = null;
+  private approvalTimer: ReturnType<typeof setInterval> | null = null;
+  /** Fingerprint of the dialog we last raised an approval for, so we don't
+   *  spam the operator with duplicate prompts each poll. Cleared when the
+   *  pane no longer shows a dialog OR the operator responded. */
+  private activeApprovalFp: string | null = null;
   /** Reply target for the in-flight turn. Stays put until next paste. */
   private currentTurnReplyTo: ReplyTarget = null;
   /** The model the running `claude` process believes it's using. Updated on
@@ -408,6 +433,61 @@ export class Channel {
     }
   }
 
+  private startApprovalPoll(): void {
+    if (this.approvalTimer) return;
+    if (!this.opts.callbacks.onApprovalNeeded) return;
+    this.approvalTimer = setInterval(() => void this.checkForApprovalDialog(), APPROVAL_POLL_MS);
+  }
+
+  private stopApprovalPoll(): void {
+    if (this.approvalTimer) clearInterval(this.approvalTimer);
+    this.approvalTimer = null;
+    this.activeApprovalFp = null;
+  }
+
+  private async checkForApprovalDialog(): Promise<void> {
+    if (this.state !== "running" && this.state !== "interrupting") return;
+    if (!this.currentTurnReplyTo) return;
+    if (!this.opts.callbacks.onApprovalNeeded) return;
+    let pane: string;
+    try {
+      pane = await capturePane(this.opts.session.tmuxSession);
+    } catch {
+      return;
+    }
+    const dialog = parsePermissionDialog(pane);
+    if (!dialog) {
+      this.activeApprovalFp = null;
+      return;
+    }
+    if (dialog.fingerprint === this.activeApprovalFp) return; // already raised
+    this.activeApprovalFp = dialog.fingerprint;
+    const target = this.opts.session.tmuxSession;
+    const api: ApprovalApi = {
+      selectOption: async (index) => {
+        // 1-indexed; the cursor starts on option 1, so option N needs (N-1)
+        // Down keys then Enter.
+        const downs = Math.max(0, index - 1);
+        for (let i = 0; i < downs; i++) {
+          await sendKeys(target, "Down");
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        await pressEnter(target);
+        this.activeApprovalFp = null;
+      },
+      cancel: async () => {
+        await pressEscape(target);
+        this.activeApprovalFp = null;
+      },
+    };
+    try {
+      await this.opts.callbacks.onApprovalNeeded(dialog, this.currentTurnReplyTo, api);
+    } catch (err) {
+      console.error(`[channel ${this.opts.session.channelKey}] approval cb failed:`, err);
+      this.activeApprovalFp = null;
+    }
+  }
+
   private startTypingPulse(): void {
     if (this.typingTimer) return;
     const fire = () => {
@@ -431,6 +511,7 @@ export class Channel {
       this.interruptTimer = null;
     }
     this.stopTypingPulse();
+    this.stopApprovalPoll();
     this.state = "idle";
     void this.opts.callbacks.onTurnEnd?.();
     void this.drainQueue();
@@ -507,6 +588,7 @@ export class Channel {
     // of intercepting client-side.
     if (isPassthroughSlashCommand(item.text)) {
       this.startTypingPulse();
+      this.startApprovalPoll();
       try {
         await pasteText(target, item.text.trim());
         await new Promise((r) => setTimeout(r, 80));
@@ -525,6 +607,7 @@ export class Channel {
     const full = [inboxText, promptBody].filter(Boolean).join("\n\n");
 
     this.startTypingPulse();
+    this.startApprovalPoll();
     try {
       await this.maybeSwitchModel(item.text);
       await pasteText(target, full);
@@ -608,6 +691,7 @@ export class Channel {
     if (this.interruptTimer) clearTimeout(this.interruptTimer);
     this.interruptTimer = null;
     this.stopTypingPulse();
+    this.stopApprovalPoll();
     try {
       await killSession(this.opts.session.tmuxSession);
     } catch {}

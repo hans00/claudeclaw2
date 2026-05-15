@@ -84,6 +84,11 @@ const SETTINGS_TEMPLATE = `{
     "idleTimeoutHours": 168,
     "checkIntervalMinutes": 30
   },
+  "approval": {
+    "//": "When the agent hits a permission dialog it can't auto-resolve, ask the operator via Telegram inline buttons. Decision sent into tmux as keystrokes. Auto-cancel after timeoutSeconds.",
+    "enabled": true,
+    "timeoutSeconds": 300
+  },
   "security": {
     "level": "moderate",
     "allowedTools": [],
