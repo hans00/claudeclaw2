@@ -89,7 +89,7 @@ export interface TelegramRouter {
 
 export interface TelegramSender {
   sendMessage(chatId: number, text: string): Promise<void>;
-  setReaction(chatId: number, messageId: number, emoji: string): Promise<void>;
+  setReactions(chatId: number, messageId: number, emojis: string[]): Promise<void>;
 }
 
 export interface TelegramOptions {
@@ -143,7 +143,12 @@ export class TelegramPlatform implements TelegramSender {
     }
   }
 
-  async setReaction(chatId: number, messageId: number, emoji: string): Promise<void> {
+  /**
+   * Atomically replace the bot's reactions on a message. Telegram's
+   * setMessageReaction replaces — not appends — so multiple emojis must
+   * be sent in a single call. Passing an empty array clears the reaction.
+   */
+  async setReactions(chatId: number, messageId: number, emojis: string[]): Promise<void> {
     const token = this.opts.config.token;
     if (!token) return;
     const res = await fetch(`${API_BASE}/bot${token}/setMessageReaction`, {
@@ -152,7 +157,7 @@ export class TelegramPlatform implements TelegramSender {
       body: JSON.stringify({
         chat_id: chatId,
         message_id: messageId,
-        reaction: [{ type: "emoji", emoji }],
+        reaction: emojis.map((emoji) => ({ type: "emoji", emoji })),
         is_big: false,
       }),
     });

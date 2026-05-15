@@ -314,10 +314,9 @@ class Daemon {
       if (replyTo.platform === "telegram") {
         if (!this.telegram) return;
         if (cleanText) await this.telegram.sendMessage(replyTo.chatId, cleanText);
-        if (replyTo.messageId !== undefined) {
-          for (const emoji of reactions) {
-            await this.telegram.setReaction(replyTo.chatId, replyTo.messageId, emoji);
-          }
+        if (replyTo.messageId !== undefined && reactions.length > 0) {
+          // Telegram replaces (not appends) on each call — send all in one.
+          await this.telegram.setReactions(replyTo.chatId, replyTo.messageId, reactions);
         }
       } else if (replyTo.platform === "discord") {
         if (!this.discord) return;
