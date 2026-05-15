@@ -10,9 +10,11 @@
  */
 import { homedir } from "os";
 import { join } from "path";
+import type { AgenticConfig } from "./config";
 import { buildClaudeArgs, type SecurityConfig } from "./compose";
 import { drainInbox, formatInboxForPrompt } from "./inbox";
 import { type JsonlEvent, tailJsonl, type TailHandle } from "./jsonl";
+import { selectModel } from "./model-router";
 import { type ChannelSession } from "./sessions";
 import {
   capturePane,
@@ -72,6 +74,12 @@ export interface ChannelOptions {
   autoInterrupt?: boolean;
   /** How long to wait after Esc before forcing state=idle. Default 5_000. */
   interruptSettleMs?: number;
+  /** Default model — passed via --model at spawn. Empty = Claude Code default. */
+  defaultModel?: string;
+  /** Per-turn agentic routing config. When enabled, paste() classifies the
+   *  prompt and sends /model &lt;name&gt; via tmux if the routed model differs
+   *  from the channel's currentModel. */
+  agentic?: AgenticConfig;
 }
 
 function encodeProjectDir(projectDir: string): string {
@@ -100,8 +108,13 @@ export class Channel {
   private interruptTimer: ReturnType<typeof setTimeout> | null = null;
   /** Reply target for the in-flight turn. Stays put until next paste. */
   private currentTurnReplyTo: ReplyTarget = null;
+  /** The model the running `claude` process believes it's using. Updated on
+   *  spawn and after each /model switch. */
+  private currentModel: string = "";
 
-  constructor(private readonly opts: ChannelOptions) {}
+  constructor(private readonly opts: ChannelOptions) {
+    this.currentModel = opts.defaultModel ?? "";
+  }
 
   get currentState(): ChannelState {
     return this.state;
@@ -133,6 +146,7 @@ export class Channel {
       const args = await buildClaudeArgs({
         sessionId: session.sessionId,
         resume: opts.resume,
+        model: this.opts.defaultModel,
         multiparty: session.multiparty,
         security,
         projectDir,
@@ -275,6 +289,7 @@ export class Channel {
     this.currentTurnReplyTo = item.replyTo;
     this.state = "running";
     try {
+      await this.maybeSwitchModel(item.text);
       await pasteText(target, full);
       await new Promise((r) => setTimeout(r, 80));
       await pressEnter(target);
@@ -282,6 +297,36 @@ export class Channel {
       console.error(`[channel ${this.opts.session.channelKey}] paste failed:`, err);
       this.opts.callbacks.onError?.(err as Error);
       this.state = "idle";
+    }
+  }
+
+  /**
+   * If agentic routing is enabled, classify the next prompt and send
+   * `/model <name>` to the tmux session when the routed model differs
+   * from what the channel last left the session on. The slash command
+   * is processed client-side by Claude Code, so a short wait is enough.
+   */
+  private async maybeSwitchModel(promptText: string): Promise<void> {
+    const agentic = this.opts.agentic;
+    if (!agentic || !agentic.enabled || agentic.modes.length === 0) return;
+    const routed = selectModel(promptText, agentic.modes, agentic.defaultMode);
+    if (!routed.model) return;
+    if (routed.model === this.currentModel) return;
+
+    const target = this.opts.session.tmuxSession;
+    console.log(
+      `[channel ${this.opts.session.channelKey}] /model ${routed.model} ` +
+        `(was ${this.currentModel || "(default)"}, ${routed.reasoning})`,
+    );
+    try {
+      await sendKeys(target, `/model ${routed.model}`);
+      await new Promise((r) => setTimeout(r, 80));
+      await pressEnter(target);
+      // Claude Code's /model is client-side, near-instant.
+      await new Promise((r) => setTimeout(r, 300));
+      this.currentModel = routed.model;
+    } catch (err) {
+      console.error(`[channel ${this.opts.session.channelKey}] /model send failed:`, err);
     }
   }
 

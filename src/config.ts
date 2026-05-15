@@ -56,6 +56,19 @@ export interface HeartbeatConfig {
   excludeWindows: HeartbeatWindow[];
 }
 
+export interface AgenticMode {
+  name: string;
+  model: string;
+  keywords: string[];
+  phrases?: string[];
+}
+
+export interface AgenticConfig {
+  enabled: boolean;
+  defaultMode: string;
+  modes: AgenticMode[];
+}
+
 export interface Settings {
   telegram: TelegramConfig;
   discord: DiscordConfig;
@@ -63,6 +76,10 @@ export interface Settings {
   web: WebConfig;
   heartbeat: HeartbeatConfig;
   security: SecurityConfig;
+  /** Default model (alias like "opus"/"sonnet" or full id). Empty = let Claude Code pick. */
+  model: string;
+  /** Per-turn model routing. When enabled, classifyTask picks a mode + model based on the user prompt. */
+  agentic: AgenticConfig;
   /** Polling interval for Telegram long-poll, in seconds. Default 25. */
   telegramPollSeconds: number;
   /** Timezone for heartbeat exclude windows + cron with no override. e.g. "UTC+8". */
@@ -78,6 +95,8 @@ const DEFAULTS: Settings = {
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   heartbeat: { enabled: false, interval: 60, prompt: "", excludeWindows: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
+  model: "",
+  agentic: { enabled: false, defaultMode: "", modes: [] },
   telegramPollSeconds: 25,
   timezone: "",
 };
@@ -147,6 +166,25 @@ export async function loadSettings(): Promise<Settings> {
             (w: any) => w && typeof w.start === "string" && typeof w.end === "string",
           )
         : DEFAULTS.heartbeat.excludeWindows,
+    },
+    model: typeof raw?.model === "string" ? raw.model : DEFAULTS.model,
+    agentic: {
+      enabled: typeof raw?.agentic?.enabled === "boolean"
+        ? raw.agentic.enabled
+        : DEFAULTS.agentic.enabled,
+      defaultMode: typeof raw?.agentic?.defaultMode === "string"
+        ? raw.agentic.defaultMode
+        : DEFAULTS.agentic.defaultMode,
+      modes: Array.isArray(raw?.agentic?.modes)
+        ? raw.agentic.modes
+            .filter((m: any) => m && typeof m.name === "string" && typeof m.model === "string")
+            .map((m: any) => ({
+              name: m.name,
+              model: m.model,
+              keywords: Array.isArray(m.keywords) ? m.keywords.filter((k: any) => typeof k === "string") : [],
+              phrases: Array.isArray(m.phrases) ? m.phrases.filter((p: any) => typeof p === "string") : undefined,
+            }))
+        : DEFAULTS.agentic.modes,
     },
     telegramPollSeconds: typeof raw?.telegramPollSeconds === "number"
       ? raw.telegramPollSeconds

@@ -147,7 +147,9 @@ export interface SpawnArgsOptions extends ComposeOptions {
   sessionId: string;
   /** If true, resume an existing session instead of starting a new one. */
   resume?: boolean;
-  /** Extra args to append (e.g. --model, --name). */
+  /** Initial model alias or full id. Pass-through to `--model`. */
+  model?: string;
+  /** Extra args to append (e.g. --name). */
   extra?: string[];
 }
 
@@ -158,6 +160,9 @@ export async function buildClaudeArgs(opts: SpawnArgsOptions): Promise<string[]>
     args.push("--resume", opts.sessionId);
   } else {
     args.push("--session-id", opts.sessionId);
+  }
+  if (opts.model && opts.model.trim()) {
+    args.push("--model", opts.model.trim());
   }
   args.push(...buildSecurityArgs(opts.security));
   const append = await composeAppendSystemPrompt(opts);

@@ -12,6 +12,7 @@ import { Channel, type ChannelCallbacks, type ReplyTarget } from "./channel";
 import { loadSettings, type Settings } from "./config";
 import { CronScheduler, type Job } from "./jobs";
 import { HeartbeatScheduler, parseTimezoneOffset } from "./heartbeat";
+import { StatuslineWriter } from "./statusline";
 import { backupV1GlobalIfExists, migrateFromV1 } from "./migrate";
 import { extractReactions } from "./reactions";
 
@@ -37,6 +38,7 @@ class Daemon {
   private slack: SlackPlatform | null = null;
   private cron: CronScheduler | null = null;
   private heartbeat: HeartbeatScheduler | null = null;
+  private statusline: StatuslineWriter | null = null;
   private web: WebServer | null = null;
   private projectDir = process.cwd();
   private startedAt = Date.now();
@@ -54,6 +56,7 @@ class Daemon {
     await this.startSlack();
     this.startCron();
     this.startHeartbeat();
+    this.startStatusline();
     this.startWeb();
     this.installSignalHandlers();
     console.log(`[daemon] ready (project=${this.projectDir})`);
@@ -91,6 +94,21 @@ class Daemon {
       });
     }
     return result;
+  }
+
+  private startStatusline(): void {
+    this.statusline = new StatuslineWriter({
+      settings: () => this.settings,
+      startedAt: () => this.startedAt,
+      heartbeatLastFiredAt: () => this.heartbeat?.lastFiredAtMs ?? 0,
+      platforms: () => ({
+        telegram: !!this.telegram,
+        discord: !!this.discord,
+        slack: !!this.slack,
+        line: false,
+      }),
+    });
+    this.statusline.start();
   }
 
   private startHeartbeat(): void {
@@ -358,6 +376,8 @@ class Daemon {
       security: this.settings.security,
       projectDir: this.projectDir,
       callbacks,
+      defaultModel: this.settings.model,
+      agentic: this.settings.agentic,
     });
   }
 
@@ -418,6 +438,7 @@ class Daemon {
     console.log(`[daemon] shutting down (${reason})...`);
     this.cron?.stop();
     this.heartbeat?.stop();
+    this.statusline?.stop();
     this.web?.stop();
     if (this.telegram) await this.telegram.stop();
     if (this.discord) await this.discord.stop();

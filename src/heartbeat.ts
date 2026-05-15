@@ -97,6 +97,10 @@ export class HeartbeatScheduler {
     this.timer = null;
   }
 
+  get lastFiredAtMs(): number {
+    return this.lastFiredAt;
+  }
+
   private async tick(): Promise<void> {
     const { config, hooks, timezoneOffsetMinutes } = this.opts;
     if (!config.enabled) return;
