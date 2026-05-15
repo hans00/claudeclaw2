@@ -289,10 +289,13 @@ export class Channel {
           // slash commands — notably /context and /compact — write their UI
           // output into a user-role entry too, with distinctive markers. Detect
           // those and forward, so platform users see the result of the command
-          // they typed.
+          // they typed. Also synthesize a turn-end: slash commands don't
+          // generate an assistant `end_turn`, so otherwise the channel would
+          // stay pinned in "running" and queue every subsequent message.
           const forward = ev.userText ? extractInternalSlashOutput(ev.userText) : null;
           if (forward) {
             await this.opts.callbacks.onAssistantText(forward, this.currentTurnReplyTo);
+            this.onTurnEnd();
           }
           break;
         }

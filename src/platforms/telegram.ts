@@ -130,15 +130,19 @@ export class TelegramPlatform implements TelegramSender {
   async sendMessage(chatId: number, text: string): Promise<void> {
     const token = this.opts.config.token;
     if (!token || !text) return;
-    const chunks = chunkText(text);
+    // Convert first, then chunk on HTML paragraph boundaries so the splits
+    // never land inside a <pre>/<b>/<code> tag. Markdown→HTML can expand
+    // length 1.3–1.5x, so chunking the raw markdown was overrunning the
+    // 4096 limit once `<b>`, `<code>`, table padding etc were added.
+    const html = markdownToTelegramHtml(text);
+    const chunks = chunkHtml(html, TG_HTML_LIMIT);
     for (const chunk of chunks) {
-      const html = markdownToTelegramHtml(chunk);
       const res = await fetch(`${API_BASE}/bot${token}/sendMessage`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           chat_id: chatId,
-          text: html,
+          text: chunk,
           parse_mode: "HTML",
           disable_web_page_preview: true,
         }),
@@ -151,7 +155,7 @@ export class TelegramPlatform implements TelegramSender {
         const plainRes = await fetch(`${API_BASE}/bot${token}/sendMessage`, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ chat_id: chatId, text: chunk, disable_web_page_preview: true }),
+          body: JSON.stringify({ chat_id: chatId, text: chunk.slice(0, 4000), disable_web_page_preview: true }),
         });
         if (!plainRes.ok) {
           const b = await plainRes.text().catch(() => "");
@@ -166,17 +170,27 @@ export class TelegramPlatform implements TelegramSender {
    * Atomically replace the bot's reactions on a message. Telegram's
    * setMessageReaction replaces — not appends — so multiple emojis must
    * be sent in a single call. Passing an empty array clears the reaction.
+   *
+   * Telegram restricts bot reactions to a fixed allowlist; anything else
+   * (custom emojis, newer additions, etc) is dropped here with a warning
+   * rather than burning the whole reaction batch on a 400.
    */
   async setReactions(chatId: number, messageId: number, emojis: string[]): Promise<void> {
     const token = this.opts.config.token;
     if (!token) return;
+    const supported = emojis.filter((e) => TG_REACTION_EMOJIS.has(normalizeEmoji(e)));
+    const dropped = emojis.filter((e) => !TG_REACTION_EMOJIS.has(normalizeEmoji(e)));
+    if (dropped.length > 0) {
+      console.warn(`[telegram] dropping unsupported reactions: ${dropped.join(" ")}`);
+    }
+    if (supported.length === 0) return;
     const res = await fetch(`${API_BASE}/bot${token}/setMessageReaction`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         chat_id: chatId,
         message_id: messageId,
-        reaction: emojis.map((emoji) => ({ type: "emoji", emoji })),
+        reaction: supported.map((emoji) => ({ type: "emoji", emoji })),
         is_big: false,
       }),
     });
@@ -453,7 +467,69 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-const TG_MSG_LIMIT = 4000; // a bit under the 4096 hard limit, leaves room for splits
+const TG_MSG_LIMIT = 4000; // markdown-source-side limit for non-HTML callers
+const TG_HTML_LIMIT = 3800; // HTML-side limit (Telegram caps at 4096, leave headroom)
+
+/**
+ * Split already-converted HTML into Telegram-sized chunks at SAFE boundaries —
+ * paragraph breaks (`\n\n`) first, then single newlines. Never splits inside
+ * a tag, so each chunk is independently well-formed.
+ *
+ * If a single paragraph already exceeds the limit (rare: a very tall <pre>),
+ * it is emitted alone and Telegram may reject it — better than truncating
+ * mid-tag.
+ */
+export function chunkHtml(html: string, max: number = TG_HTML_LIMIT): string[] {
+  if (!html) return [];
+  if (html.length <= max) return [html];
+  const out: string[] = [];
+  let buf = "";
+  const paras = html.split(/\n\n+/);
+  for (const p of paras) {
+    if (p.length > max) {
+      if (buf) { out.push(buf); buf = ""; }
+      // Try to split this paragraph on single newlines.
+      const lines = p.split("\n");
+      let inner = "";
+      for (const line of lines) {
+        if (inner.length + 1 + line.length > max) {
+          if (inner) out.push(inner);
+          inner = line.length > max ? line.slice(0, max) : line;
+        } else {
+          inner = inner ? `${inner}\n${line}` : line;
+        }
+      }
+      if (inner) out.push(inner);
+      continue;
+    }
+    if (buf.length + 2 + p.length > max) {
+      out.push(buf);
+      buf = p;
+    } else {
+      buf = buf ? `${buf}\n\n${p}` : p;
+    }
+  }
+  if (buf) out.push(buf);
+  return out;
+}
+
+/**
+ * Telegram's bot-reactions allowlist (as of late 2024). Anything outside
+ * this set returns REACTION_INVALID and trashes the whole batch.
+ */
+const TG_REACTION_EMOJIS = new Set([
+  "👍","👎","❤","🔥","🥰","👏","😁","🤔","🤯","😱","🤬","😢","🎉","🤩",
+  "🤮","💩","🙏","👌","🕊","🤡","🥱","🥴","😍","🐳","❤‍🔥","🌚","🌭","💯",
+  "🤣","⚡","🍌","🏆","💔","🤨","😐","🍓","🍾","💋","🖕","😈","😴","😭",
+  "🤓","👻","👨‍💻","👀","🎃","🙈","😇","😨","🤝","✍","🤗","🫡","🎅","🎄",
+  "☃","💅","🤪","🗿","🆒","💘","🙉","🦄","😘","💊","🙊","😎","👾","🤷‍♂",
+  "🤷","🤷‍♀","😡",
+]);
+
+/** Strip variation selector U+FE0F so ❤️ and ❤ compare equal. */
+function normalizeEmoji(s: string): string {
+  return s.replace(/️/g, "");
+}
 
 export function chunkText(text: string, max: number = TG_MSG_LIMIT): string[] {
   if (text.length <= max) return text ? [text] : [];
