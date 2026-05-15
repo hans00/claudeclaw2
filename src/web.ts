@@ -20,7 +20,14 @@ import { homedir } from "os";
 import { join } from "path";
 import { appendInbox } from "./inbox";
 import { parseLine, type JsonlEvent } from "./jsonl";
-import { loadJobs, type Job } from "./jobs";
+import {
+  deleteJob,
+  isValidJobName,
+  loadJob,
+  loadJobs,
+  saveJob,
+  type Job,
+} from "./jobs";
 import { nextCronMatch } from "./cron";
 import { loadSessions, type ChannelSession } from "./sessions";
 import type { Channel, ReplyTarget } from "./channel";
@@ -78,6 +85,16 @@ export class WebServer {
     try {
       if (req.method === "GET" && path === "/") return this.html(await this.renderHome());
       if (req.method === "GET" && path === "/jobs") return this.html(await this.renderJobs());
+      if (req.method === "GET" && path === "/jobs/new") return this.html(this.renderJobForm(null, ""));
+      if (req.method === "POST" && path === "/jobs") return this.handleJobCreate(req);
+      const jobMatch = path.match(/^\/jobs\/([A-Za-z0-9._-]+)(\/edit|\/delete)?$/);
+      if (jobMatch) {
+        const [, name, action] = jobMatch;
+        if (req.method === "GET" && !action) return this.html(await this.renderJobView(name));
+        if (req.method === "GET" && action === "/edit") return this.html(await this.renderJobEdit(name));
+        if (req.method === "POST" && !action) return this.handleJobSave(req, name);
+        if (req.method === "POST" && action === "/delete") return this.handleJobDelete(name);
+      }
       if (req.method === "GET" && path === "/logs") return this.html(await this.renderLogsList());
 
       const logMatch = req.method === "GET" && path.startsWith("/logs/");
@@ -269,15 +286,143 @@ export class WebServer {
         try {
           next = new Date(nextCronMatch(j.schedule, now, j.timezoneOffsetMinutes)).toISOString();
         } catch {}
-        return `<tr><td>${esc(j.name)}</td><td><code>${esc(j.schedule)}</code></td><td>${esc(j.target)}</td><td>${esc(next)}</td><td>${j.recurring ? "♻" : "1×"}</td></tr>`;
+        const nameEnc = encodeURIComponent(j.name);
+        const actions = [
+          `<a href="/jobs/${nameEnc}">view</a>`,
+          `<a href="/jobs/${nameEnc}/edit">edit</a>`,
+          `<form method="post" action="/jobs/${nameEnc}/delete" style="display:inline" ` +
+            `onsubmit="return confirm('Delete job &quot;${esc(j.name)}&quot;?')">` +
+            `<button type="submit" class="link">delete</button></form>`,
+        ].join(" · ");
+        return `<tr><td><a href="/jobs/${nameEnc}">${esc(j.name)}</a></td>` +
+          `<td><code>${esc(j.schedule)}</code></td><td>${esc(j.target)}</td>` +
+          `<td>${esc(next)}</td><td>${j.recurring ? "♻" : "1×"}</td>` +
+          `<td class="dim">${actions}</td></tr>`;
       })
       .join("\n");
     return layout(
       "jobs",
-      `<p><a href="/">← home</a></p><h1>cron jobs</h1>
-<table><thead><tr><th>name</th><th>schedule</th><th>target</th><th>next fire</th><th></th></tr></thead>
-<tbody>${rows || `<tr><td colspan="5"><em>(no jobs)</em></td></tr>`}</tbody></table>`,
+      `<p><a href="/">← home</a></p><h1>cron jobs · <a href="/jobs/new">+ new</a></h1>
+<table><thead><tr><th>name</th><th>schedule</th><th>target</th><th>next fire</th><th></th><th></th></tr></thead>
+<tbody>${rows || `<tr><td colspan="6"><em>(no jobs)</em></td></tr>`}</tbody></table>`,
     );
+  }
+
+  private async renderJobView(name: string): Promise<string> {
+    const job = await loadJob(name).catch(() => null);
+    if (!job) return layout("job", `<p><a href="/jobs">← jobs</a></p><p>job not found: <code>${esc(name)}</code></p>`);
+    const now = new Date();
+    let next = "—";
+    try { next = new Date(nextCronMatch(job.schedule, now, job.timezoneOffsetMinutes)).toISOString(); } catch {}
+    const nameEnc = encodeURIComponent(name);
+    return layout(
+      `job · ${name}`,
+      `<p><a href="/jobs">← jobs</a></p>
+<h1>${esc(name)}</h1>
+<p class="dim"><a href="/jobs/${nameEnc}/edit">edit</a> ·
+<form method="post" action="/jobs/${nameEnc}/delete" style="display:inline" onsubmit="return confirm('Delete?')">
+  <button type="submit" class="link">delete</button>
+</form></p>
+<table>
+<tr><th>schedule</th><td><code>${esc(job.schedule)}</code></td></tr>
+<tr><th>target</th><td><code>${esc(job.target)}</code></td></tr>
+<tr><th>recurring</th><td>${job.recurring ? "yes" : "no (one-shot, deleted after fire)"}</td></tr>
+<tr><th>next fire</th><td>${esc(next)}</td></tr>
+</table>
+<h3>prompt</h3>
+<pre>${esc(job.body)}</pre>`,
+    );
+  }
+
+  private async renderJobEdit(name: string): Promise<string> {
+    const job = await loadJob(name).catch(() => null);
+    if (!job) return layout("job", `<p><a href="/jobs">← jobs</a></p><p>job not found: <code>${esc(name)}</code></p>`);
+    return this.renderJobForm(job, "");
+  }
+
+  private renderJobForm(existing: Job | null, errorMsg: string): string {
+    const isNew = existing === null;
+    const nameField = isNew
+      ? `<label>name <input type="text" name="name" required pattern="[A-Za-z0-9._-]+" autocomplete="off"></label>`
+      : `<label>name <input type="text" value="${esc(existing.name)}" disabled></label>`;
+    const action = isNew ? "/jobs" : `/jobs/${encodeURIComponent(existing.name)}`;
+    const tzMinutes = existing?.timezoneOffsetMinutes ?? 0;
+    const tzStr = existing && tzMinutes !== 0
+      ? (tzMinutes > 0 ? "+" : "-") + String(Math.floor(Math.abs(tzMinutes) / 60)).padStart(2, "0") + ":" + String(Math.abs(tzMinutes) % 60).padStart(2, "0")
+      : "";
+    const replyToStr = formatReplyToInput(existing?.replyTo);
+    return layout(
+      isNew ? "new job" : `edit ${existing.name}`,
+      `<p><a href="/jobs">← jobs</a></p>
+<h1>${isNew ? "new cron job" : `edit · ${esc(existing.name)}`}</h1>
+${errorMsg ? `<p style="color:#c00">${esc(errorMsg)}</p>` : ""}
+<form method="post" action="${action}" class="form">
+  ${nameField}
+  <label>schedule (5-field cron)
+    <input type="text" name="schedule" value="${esc(existing?.schedule ?? "0 9 * * *")}" required>
+  </label>
+  <label>target
+    <input type="text" name="target" value="${esc(existing?.target ?? "global")}" placeholder="global | discord:&lt;id&gt; | slack:&lt;id&gt; | line:&lt;id&gt;">
+  </label>
+  <label>replyTo (optional — where output is delivered; blank = log only)
+    <input type="text" name="replyTo" value="${esc(replyToStr)}" placeholder="telegram:&lt;chatId&gt; | discord:&lt;channelId&gt; | …">
+  </label>
+  <label>timezone (optional, +HH:MM)
+    <input type="text" name="timezone" value="${esc(tzStr)}" placeholder="+08:00">
+  </label>
+  <label class="cb"><input type="checkbox" name="recurring" value="true" ${existing?.recurring !== false ? "checked" : ""}> recurring (uncheck = one-shot)</label>
+  <label>prompt (markdown body)
+    <textarea name="body" rows="10" required>${esc(existing?.body ?? "")}</textarea>
+  </label>
+  <p><button type="submit">${isNew ? "create" : "save"}</button></p>
+</form>`,
+    );
+  }
+
+  private async handleJobCreate(req: Request): Promise<Response> {
+    const form = await readForm(req);
+    if (!form) return this.json({ error: "bad form" }, 400);
+    const name = (form.get("name") ?? "").trim();
+    if (!isValidJobName(name)) {
+      return this.html(this.renderJobForm(null, `invalid name "${name}"`), 400);
+    }
+    const existing = await loadJob(name).catch(() => null);
+    if (existing) {
+      return this.html(this.renderJobForm(null, `job "${name}" already exists — use edit`), 409);
+    }
+    return this.saveFromForm(name, form);
+  }
+
+  private async handleJobSave(req: Request, name: string): Promise<Response> {
+    if (!isValidJobName(name)) return new Response("invalid name", { status: 400 });
+    const form = await readForm(req);
+    if (!form) return this.json({ error: "bad form" }, 400);
+    return this.saveFromForm(name, form);
+  }
+
+  private async saveFromForm(name: string, form: URLSearchParams): Promise<Response> {
+    const schedule = (form.get("schedule") ?? "").trim();
+    const target = (form.get("target") ?? "global").trim() || "global";
+    const replyTo = (form.get("replyTo") ?? "").trim() || undefined;
+    const timezone = (form.get("timezone") ?? "").trim() || undefined;
+    const recurring = form.get("recurring") === "true";
+    const body = (form.get("body") ?? "").trim();
+    if (!schedule || !body) {
+      return new Response("schedule and body are required", { status: 400 });
+    }
+    try {
+      await saveJob(name, { schedule, recurring, target, replyTo, timezone, body });
+    } catch (err) {
+      return new Response(`save failed: ${(err as Error).message}`, { status: 400 });
+    }
+    return Response.redirect(`/jobs/${encodeURIComponent(name)}`, 303);
+  }
+
+  private async handleJobDelete(name: string): Promise<Response> {
+    if (!isValidJobName(name)) return new Response("invalid name", { status: 400 });
+    const ok = await deleteJob(name).catch(() => false);
+    if (!ok) return new Response("delete failed", { status: 404 });
+    return Response.redirect("/jobs", 303);
   }
 
   private async renderLogsList(): Promise<string> {
@@ -380,6 +525,25 @@ ${footer}`,
   }
 }
 
+/** Read application/x-www-form-urlencoded body into a URLSearchParams. */
+async function readForm(req: Request): Promise<URLSearchParams | null> {
+  try {
+    const body = await req.text();
+    return new URLSearchParams(body);
+  } catch {
+    return null;
+  }
+}
+
+function formatReplyToInput(replyTo: ReplyTarget | undefined): string {
+  if (!replyTo) return "";
+  if (replyTo.platform === "telegram") return `telegram:${replyTo.chatId}`;
+  if (replyTo.platform === "discord") return `discord:${replyTo.channelId}`;
+  if (replyTo.platform === "slack") return `slack:${replyTo.channelId}${replyTo.threadTs ? `:${replyTo.threadTs}` : ""}`;
+  if (replyTo.platform === "line") return `line:${replyTo.to}`;
+  return "";
+}
+
 function parseReplyTo(input: unknown): ReplyTarget {
   if (!input || typeof input !== "object") return null;
   const r = input as Record<string, unknown>;
@@ -425,6 +589,14 @@ code{background:#f3f3f3;padding:0 .3rem;border-radius:3px;font-size:.85em}
 .msg.result{border-left-color:#94a3b8;background:#f8fafc}
 .msg.result.error{border-left-color:#ef4444;background:#fef2f2}
 pre.log{background:#0f1116;color:#cdd6f4;padding:1rem;border-radius:4px;overflow:auto;font-size:.8em;max-height:80vh;white-space:pre-wrap;word-wrap:break-word}
+.form label{display:block;margin:.7rem 0}
+.form label > input[type=text]{display:block;width:100%;margin-top:.25rem;padding:.4rem;font:inherit;box-sizing:border-box}
+.form label > textarea{display:block;width:100%;margin-top:.25rem;padding:.4rem;font:.9em ui-monospace,monospace;box-sizing:border-box}
+.form label.cb{display:flex;align-items:center;gap:.5rem}
+.form button{padding:.5rem 1.2rem;font:inherit;background:#0066cc;color:white;border:0;border-radius:4px;cursor:pointer}
+.form button:hover{background:#0055aa}
+button.link{background:none;border:0;color:#0066cc;cursor:pointer;font:inherit;padding:0}
+button.link:hover{text-decoration:underline}
 </style></head><body>${body}</body></html>`;
 }
 

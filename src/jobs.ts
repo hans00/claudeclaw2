@@ -17,7 +17,7 @@
  * fired into the target channel's queue. Non-recurring jobs delete the
  * file after firing so they only run once.
  */
-import { readdir, readFile, unlink } from "fs/promises";
+import { mkdir, readdir, readFile, unlink, writeFile } from "fs/promises";
 import { join, basename, extname } from "path";
 import { cronMatches } from "./cron";
 import type { ReplyTarget } from "./channel";
@@ -95,6 +95,86 @@ function parseTimezone(value: string | undefined): number {
   const hh = Number(m[2]);
   const mm = Number(m[3] ?? "0");
   return sign * (hh * 60 + mm);
+}
+
+/** Filenames may only contain a-z A-Z 0-9 . _ -  — no slashes or .. */
+export function isValidJobName(name: string): boolean {
+  return /^[a-zA-Z0-9._-]+$/.test(name) && !name.startsWith(".");
+}
+
+export interface JobFields {
+  schedule: string;
+  recurring: boolean;
+  target: string;
+  replyTo?: string;
+  timezone?: string;
+  body: string;
+}
+
+/** Read a single job file by name. Returns null when missing or invalid. */
+export async function loadJob(name: string): Promise<Job | null> {
+  if (!isValidJobName(name)) return null;
+  const filePath = join(JOBS_DIR, `${name}.md`);
+  let content: string;
+  try {
+    content = await readFile(filePath, "utf8");
+  } catch (err: any) {
+    if (err?.code === "ENOENT") return null;
+    throw err;
+  }
+  const { meta, body } = parseFrontmatter(content);
+  if (!meta.schedule) return null;
+  return {
+    name,
+    filePath,
+    schedule: meta.schedule,
+    recurring: meta.recurring === undefined ? true : meta.recurring.toLowerCase() !== "false",
+    target: meta.target?.trim() || GLOBAL_KEY,
+    replyTo: parseReplyTo(meta.replyTo),
+    timezoneOffsetMinutes: parseTimezone(meta.timezone),
+    body: body || "",
+  };
+}
+
+function serializeFrontmatterValue(v: string | boolean): string {
+  if (typeof v === "boolean") return String(v);
+  if (/^[a-zA-Z0-9._:+-]+$/.test(v) && v.length > 0) return v;
+  return `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/** Write a job file. Creates the jobs dir if needed. Overwrites. */
+export async function saveJob(name: string, fields: JobFields): Promise<void> {
+  if (!isValidJobName(name)) throw new Error(`invalid job name "${name}"`);
+  if (!fields.schedule.trim()) throw new Error("schedule is required");
+  const lines: string[] = ["---"];
+  lines.push(`schedule: ${serializeFrontmatterValue(fields.schedule)}`);
+  lines.push(`recurring: ${fields.recurring}`);
+  if (fields.target && fields.target !== GLOBAL_KEY) {
+    lines.push(`target: ${serializeFrontmatterValue(fields.target)}`);
+  }
+  if (fields.replyTo) {
+    lines.push(`replyTo: ${serializeFrontmatterValue(fields.replyTo)}`);
+  }
+  if (fields.timezone) {
+    lines.push(`timezone: ${serializeFrontmatterValue(fields.timezone)}`);
+  }
+  lines.push("---");
+  lines.push("");
+  lines.push(fields.body.trim());
+  lines.push("");
+  await mkdir(JOBS_DIR, { recursive: true });
+  await writeFile(join(JOBS_DIR, `${name}.md`), lines.join("\n"), "utf8");
+}
+
+export async function deleteJob(name: string): Promise<boolean> {
+  if (!isValidJobName(name)) return false;
+  try {
+    await unlink(join(JOBS_DIR, `${name}.md`));
+    return true;
+  } catch (err: any) {
+    if (err?.code === "ENOENT") return false;
+    throw err;
+  }
 }
 
 export async function loadJobs(): Promise<Job[]> {
