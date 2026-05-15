@@ -29,6 +29,7 @@ async function main(): Promise<void> {
     case "send":    await runSend(rest); return;
     case "trigger": await runTrigger(rest); return;
     case "stop":    await runStop(); return;
+    case "reload":  await runReload(); return;
     default:
       console.error(`unknown subcommand: ${cmd}`);
       printHelp();
@@ -57,6 +58,9 @@ function printHelp(): void {
   send <target> <text...>     Deliver text into target channel's inbox
   trigger <target> <prompt..> Run the agent on target channel with prompt
   stop                        Send SIGTERM to the running daemon (via pid file)
+  reload                      Send SIGHUP so the daemon re-reads settings.json
+                              (hot-update agentic/heartbeat/timezone; tokens +
+                              web still need a full restart)
 
   Targets:  global  |  telegram:<chatId>  |  discord:<channelId>  |
             slack:<channelId>[:<threadTs>]  |  line:<sourceId>
@@ -106,6 +110,27 @@ async function runTrigger(args: string[]): Promise<void> {
     body: JSON.stringify({ target, prompt: promptParts.join(" "), fromLabel: "cli" }),
   });
   console.log(await res.text());
+}
+
+async function runReload(): Promise<void> {
+  let pid: number;
+  try {
+    pid = Number((await readFile(PID_FILE, "utf8")).trim());
+  } catch {
+    console.error(`[cli] no pid file at ${PID_FILE} — daemon not running`);
+    process.exit(1);
+  }
+  if (!Number.isFinite(pid) || pid <= 0) {
+    console.error(`[cli] invalid pid in ${PID_FILE}`);
+    process.exit(1);
+  }
+  try {
+    process.kill(pid, "SIGHUP");
+    console.log(`[cli] SIGHUP sent to pid ${pid} — daemon will re-read settings.json`);
+  } catch (err) {
+    console.error(`[cli] kill ${pid} failed:`, err);
+    process.exit(1);
+  }
 }
 
 async function runStop(): Promise<void> {

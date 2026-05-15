@@ -6,6 +6,7 @@
  * existing sessions on startup so daemon restarts don't reset conversations.
  */
 import { randomUUID } from "crypto";
+import { watch } from "fs";
 import { mkdir, unlink, writeFile } from "fs/promises";
 import { dirname, join } from "path";
 import { Channel, type ChannelCallbacks, type ReplyTarget } from "./channel";
@@ -18,6 +19,7 @@ import { backupV1GlobalIfExists, migrateFromV1 } from "./migrate";
 import { extractReactions } from "./reactions";
 
 const PID_FILE = join(".claude", "claudeclaw", "daemon.pid");
+const SETTINGS_PATH = join(".claude", "claudeclaw", "settings.json");
 import {
   GLOBAL_KEY,
   loadSessions,
@@ -67,8 +69,95 @@ class Daemon {
     this.startHeartbeat();
     this.startStatusline();
     this.startWeb();
+    this.watchSettings();
     this.installSignalHandlers();
     console.log(`[daemon] ready (project=${this.projectDir})`);
+  }
+
+  /**
+   * Watch settings.json for changes (debounced) and trigger a hot-reload.
+   * Also responds to SIGHUP — installed in installSignalHandlers().
+   */
+  private watchSettings(): void {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      watch(SETTINGS_PATH, () => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+          timer = null;
+          void this.reloadSettings("file change");
+        }, 200);
+      });
+      console.log("[daemon] watching settings.json for changes");
+    } catch (err) {
+      console.warn("[daemon] could not watch settings.json:", err);
+    }
+  }
+
+  /**
+   * Re-read settings.json and push live-mutable subsets into the running
+   * subsystems. Logs a warning for fields that need a daemon restart.
+   */
+  async reloadSettings(reason: string): Promise<void> {
+    let next: Settings;
+    try {
+      next = await loadSettings();
+    } catch (err) {
+      console.error(`[daemon] reload failed: ${(err as Error).message}`);
+      return;
+    }
+    const prev = this.settings;
+    console.log(`[daemon] reloading settings (${reason})`);
+
+    const cantChange: string[] = [];
+    if (prev.telegram.token !== next.telegram.token) cantChange.push("telegram.token");
+    if (prev.discord.token !== next.discord.token) cantChange.push("discord.token");
+    if (prev.slack.appToken !== next.slack.appToken || prev.slack.botToken !== next.slack.botToken) {
+      cantChange.push("slack.*Token");
+    }
+    if (
+      prev.line.channelAccessToken !== next.line.channelAccessToken ||
+      prev.line.channelSecret !== next.line.channelSecret ||
+      prev.line.webhookPort !== next.line.webhookPort
+    ) {
+      cantChange.push("line.*");
+    }
+    if (
+      prev.web.enabled !== next.web.enabled ||
+      prev.web.host !== next.web.host ||
+      prev.web.port !== next.web.port
+    ) {
+      cantChange.push("web");
+    }
+    if (prev.model !== next.model) cantChange.push("model (default — affects only new sessions)");
+    if (cantChange.length > 0) {
+      console.warn(`[daemon] these settings need a restart to take effect: ${cantChange.join(", ")}`);
+    }
+
+    this.settings = next;
+
+    // Channels: agentic + timezone are live-mutable per channel.
+    const tz = parseTimezoneOffset(next.timezone);
+    for (const channel of this.channels.values()) {
+      channel.updateRuntime({ agentic: next.agentic, timezoneOffsetMinutes: tz });
+    }
+
+    // Heartbeat: easiest to rebuild — captures config at constructor time.
+    if (
+      JSON.stringify(prev.heartbeat) !== JSON.stringify(next.heartbeat) ||
+      prev.timezone !== next.timezone
+    ) {
+      console.log("[daemon] heartbeat config changed — rebuilding scheduler");
+      this.heartbeat?.stop();
+      this.startHeartbeat();
+    }
+
+    // Cron jobs are reloaded per-tick from disk, no action needed.
+    // Statusline reads settings via a getter, picks up changes automatically.
+    // Per-channel discord rules (settings.discord.channels) are consulted on
+    // each inbound, also automatic.
+
+    console.log(`[daemon] reload done`);
   }
 
   private startWeb(): void {
@@ -710,6 +799,7 @@ class Daemon {
     };
     process.on("SIGINT", () => stop("SIGINT"));
     process.on("SIGTERM", () => stop("SIGTERM"));
+    process.on("SIGHUP", () => void this.reloadSettings("SIGHUP"));
   }
 
   async shutdown(reason: string): Promise<void> {

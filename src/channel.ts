@@ -241,6 +241,22 @@ export class Channel {
     return this.state;
   }
 
+  /**
+   * Hot-reload mutable runtime config. Snapshots of these are taken at
+   * construction time; this updater lets the daemon push fresh values
+   * after a settings.json reload without re-creating the channel.
+   *
+   * Fields baked into the tmux process (`security`, `defaultModel`,
+   * `--append-system-prompt`) can't change without respawning the
+   * underlying `claude` — those still require a restart.
+   */
+  updateRuntime(updates: { agentic?: AgenticConfig; timezoneOffsetMinutes?: number }): void {
+    if (updates.agentic !== undefined) this.opts.agentic = updates.agentic;
+    if (updates.timezoneOffsetMinutes !== undefined) {
+      this.opts.timezoneOffsetMinutes = updates.timezoneOffsetMinutes;
+    }
+  }
+
   get tmuxSession(): string {
     return this.opts.session.tmuxSession;
   }
