@@ -140,7 +140,9 @@ function classifyInternalOutput(text: string): InternalClassification {
 
 /** Strip ANSI SGR escape sequences (color/bold/etc) from a string. */
 function stripAnsi(s: string): string {
-  return s.replace(/\[[0-9;]*[A-Za-z]/g, "");
+  return s
+    .replace(/\u001b\[[0-9;]*[A-Za-z]/g, "")
+    .replace(/\[[0-9;]+m/g, "");
 }
 
 function renderSourceLine(item: QueueItem): string {
