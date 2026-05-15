@@ -107,6 +107,25 @@ function jsonlPathFor(sessionId: string, projectDir: string): string {
   return join(homedir(), ".claude", "projects", encoded, `${sessionId}.jsonl`);
 }
 
+/**
+ * Detect "internal" slash-command output that Claude Code wrote into a
+ * user-role jsonl entry. Returns the text to forward, or null to skip.
+ *
+ *   `## Context Usage ...`                    → /context report (forward as-is)
+ *   `<local-command-stdout>x</local-command-stdout>`  → wrapped stdout (forward inner)
+ *   anything else (our own pastes, <command-name>, <local-command-caveat>) → skip
+ */
+function extractInternalSlashOutput(text: string): string | null {
+  const t = text.trimStart();
+  if (t.startsWith("## Context Usage")) return t;
+  const wrapped = t.match(/^<local-command-stdout>([\s\S]*?)<\/local-command-stdout>\s*$/);
+  if (wrapped) {
+    const inner = wrapped[1].trim();
+    return inner || null;
+  }
+  return null;
+}
+
 function renderSourceLine(item: QueueItem): string {
   if (item.source) {
     const s = item.source;
@@ -264,10 +283,23 @@ export class Channel {
             await this.opts.callbacks.onToolUse(ev.toolName, ev.toolInput, this.currentTurnReplyTo);
           }
           break;
+        case "user-message": {
+          // Most user-message entries are our own pastes (echoed back by Claude
+          // Code into the session) and we don't want to forward those. But some
+          // slash commands — notably /context and /compact — write their UI
+          // output into a user-role entry too, with distinctive markers. Detect
+          // those and forward, so platform users see the result of the command
+          // they typed.
+          const forward = ev.userText ? extractInternalSlashOutput(ev.userText) : null;
+          if (forward) {
+            await this.opts.callbacks.onAssistantText(forward, this.currentTurnReplyTo);
+          }
+          break;
+        }
         case "turn-end":
           this.onTurnEnd();
           break;
-        // Skipped: assistant-thinking, user-tool-result, user-message, system, unknown
+        // Skipped: assistant-thinking, user-tool-result, system, unknown
       }
     } catch (err) {
       console.error(`[channel ${this.opts.session.channelKey}] event handler error:`, err);
