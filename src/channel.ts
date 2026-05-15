@@ -93,6 +93,20 @@ function jsonlPathFor(sessionId: string, projectDir: string): string {
 }
 
 /**
+ * Detect a single-line slash command. Matches `/name`, `/name arg arg`,
+ * `/name:sub`, `/skill-foo` — anything that's a single line starting with
+ * `/<letter>` followed by an identifier-ish run.
+ *
+ * Rejects paths like `/etc/foo` (slash inside the identifier) and
+ * multi-line messages that just happen to start with `/`.
+ */
+export function isPassthroughSlashCommand(text: string): boolean {
+  const t = text.trim();
+  if (!t || t.includes("\n")) return false;
+  return /^\/[a-zA-Z][\w:-]*(\s+\S.*?)?$/.test(t);
+}
+
+/**
  * POSIX shell single-quote escape. Wraps arbitrary text so it survives a
  * trip through the shell tmux is typing into (sh/bash/zsh all accept this).
  */
@@ -283,12 +297,30 @@ export class Channel {
 
   private async paste(item: QueueItem): Promise<void> {
     const target = this.opts.session.tmuxSession;
+    this.currentTurnReplyTo = item.replyTo;
+    this.state = "running";
+
+    // Slash commands (Claude Code built-ins, skills, etc) must reach the
+    // input box CLEAN — any "[fromLabel] " prefix or inbox preamble would
+    // turn them into ordinary text that claude routes to the model instead
+    // of intercepting client-side.
+    if (isPassthroughSlashCommand(item.text)) {
+      try {
+        await pasteText(target, item.text.trim());
+        await new Promise((r) => setTimeout(r, 80));
+        await pressEnter(target);
+      } catch (err) {
+        console.error(`[channel ${this.opts.session.channelKey}] slash paste failed:`, err);
+        this.opts.callbacks.onError?.(err as Error);
+        this.state = "idle";
+      }
+      return;
+    }
+
     const inboxText = await this.buildInboxPrefix();
     const head = item.fromLabel ? `[${item.fromLabel}] ` : "";
     const full = [inboxText, head + item.text].filter(Boolean).join("\n\n");
 
-    this.currentTurnReplyTo = item.replyTo;
-    this.state = "running";
     try {
       await this.maybeSwitchModel(item.text);
       await pasteText(target, full);
