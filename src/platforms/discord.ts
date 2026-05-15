@@ -11,6 +11,12 @@
  * Resume (we always re-Identify on reconnect — simpler, only slightly less
  * efficient).
  */
+import {
+  downloadAttachment,
+  extFromName,
+  kindFromMime,
+  type InboundAttachment,
+} from "../attachments";
 import type { DiscordConfig, DiscordChannelConfig } from "../config";
 
 const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -41,7 +47,13 @@ export interface DiscordInbound {
   isBot: boolean;
   mentionsBot: boolean;
   text: string;
+  attachments: InboundAttachment[];
 }
+
+// Discord message flag bits we care about. VOICE_MESSAGE marks the message
+// as a "voice note" so we tag the attachment with kind="voice" instead of
+// the generic "audio".
+const FLAG_VOICE_MESSAGE = 1 << 13; // 8192
 
 export interface DiscordRouter {
   handleMessage(msg: DiscordInbound): Promise<void>;
@@ -241,6 +253,7 @@ export class DiscordPlatform implements DiscordSender {
     }
 
     const fromName = String(m.author.global_name ?? m.author.username ?? userId);
+    const attachments = await this.collectAttachments(m, channelId);
     await this.opts.router.handleMessage({
       guildId,
       channelId,
@@ -250,7 +263,57 @@ export class DiscordPlatform implements DiscordSender {
       isBot,
       mentionsBot,
       text,
+      attachments,
     });
+  }
+
+  private async collectAttachments(m: any, channelId: string): Promise<InboundAttachment[]> {
+    const results: InboundAttachment[] = [];
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const isVoiceMsg = typeof m.flags === "number" && (m.flags & FLAG_VOICE_MESSAGE) !== 0;
+
+    if (Array.isArray(m.attachments)) {
+      for (const a of m.attachments) {
+        if (!a?.url) continue;
+        const mime: string | undefined = a.content_type;
+        const filename: string | undefined = a.filename;
+        let kind = kindFromMime(mime);
+        // A voice-flagged message's audio attachment is a "voice" note.
+        if (isVoiceMsg && kind === "audio") kind = "voice";
+        const att = await downloadAttachment({
+          url: a.url,
+          scope: channelId,
+          kind,
+          ext: extFromName(filename),
+          originalName: filename,
+          mimeType: mime,
+          fileSize: typeof a.size === "number" ? a.size : undefined,
+          duration: typeof a.duration_secs === "number" ? a.duration_secs : undefined,
+          timestamp: ts,
+        });
+        if (att) results.push(att);
+      }
+    }
+
+    // Stickers come as separate objects with CDN urls. Pull each as a webp.
+    if (Array.isArray(m.sticker_items)) {
+      for (const s of m.sticker_items) {
+        if (!s?.id) continue;
+        const url = `https://media.discordapp.net/stickers/${s.id}.webp`;
+        const att = await downloadAttachment({
+          url,
+          scope: channelId,
+          kind: "sticker",
+          ext: ".webp",
+          originalName: s.name,
+          mimeType: "image/webp",
+          timestamp: ts,
+        });
+        if (att) results.push(att);
+      }
+    }
+
+    return results;
   }
 
   // --- REST outbound ---

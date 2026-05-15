@@ -19,7 +19,8 @@ import {
   upsertSession,
   type ChannelSession,
 } from "./sessions";
-import { TelegramPlatform, type InboundAttachment, type InboundMessage, type TelegramRouter } from "./platforms/telegram";
+import { TelegramPlatform, type InboundMessage, type TelegramRouter } from "./platforms/telegram";
+import { composePromptWithAttachments } from "./attachments";
 import { DiscordPlatform, type DiscordInbound, type DiscordRouter } from "./platforms/discord";
 import { SlackPlatform, type SlackInbound, type SlackRouter } from "./platforms/slack";
 import { WebServer, type SessionView, type WebDaemonView } from "./web";
@@ -193,8 +194,9 @@ class Daemon {
     const channel = await this.ensureChannel(key, kind, multiparty);
     if (!channel) return;
     await touchActivity(key);
+    const text = composePromptWithAttachments(msg.text, msg.attachments);
     await channel.handleIncoming({
-      text: msg.text,
+      text,
       fromLabel: msg.fromName,
       platformMsgId: msg.messageTs,
       replyTo,
@@ -214,8 +216,9 @@ class Daemon {
     const channel = await this.ensureChannel(key, kind, multiparty);
     if (!channel) return;
     await touchActivity(key);
+    const text = composePromptWithAttachments(msg.text, msg.attachments);
     await channel.handleIncoming({
-      text: msg.text,
+      text,
       fromLabel: msg.fromName,
       platformMsgId: msg.messageId,
       replyTo,
@@ -234,7 +237,7 @@ class Daemon {
     const channel = await this.ensureChannel(key, "global", /*multiparty*/ false);
     if (!channel) return;
     await touchActivity(key);
-    const text = composeWithAttachments(msg.text, msg.attachments);
+    const text = composePromptWithAttachments(msg.text, msg.attachments);
     await channel.handleIncoming({
       text,
       fromLabel: msg.fromName,
@@ -365,20 +368,6 @@ class Daemon {
     }
     process.exit(0);
   }
-}
-
-function composeWithAttachments(text: string, attachments: InboundAttachment[]): string {
-  if (!attachments.length) return text;
-  const lines: string[] = [];
-  for (const a of attachments) {
-    const bits: string[] = [`Attached ${a.kind}`];
-    if (a.duration !== undefined) bits.push(`${a.duration}s`);
-    if (a.originalName) bits.push(`name=${a.originalName}`);
-    if (a.mimeType) bits.push(`mime=${a.mimeType}`);
-    lines.push(`[${bits.join(" · ")}: ${a.localPath}]`);
-  }
-  if (text) lines.push("", text);
-  return lines.join("\n");
 }
 
 function deriveKindFromKey(

@@ -12,6 +12,12 @@
  *
  * Not in scope yet: slash commands, interactivity, channel-listing/refresh.
  */
+import {
+  downloadAttachment,
+  extFromName,
+  kindFromMime,
+  type InboundAttachment,
+} from "../attachments";
 import type { SlackConfig } from "../config";
 
 const WEB_API = "https://slack.com/api";
@@ -25,6 +31,7 @@ export interface SlackInbound {
   fromName: string;
   isBot: boolean;
   text: string;
+  attachments: InboundAttachment[];
 }
 
 export interface SlackRouter {
@@ -165,6 +172,7 @@ export class SlackPlatform implements SlackSender {
         : e.channel_type === "mpim" ? "mpim"
         : "unknown";
 
+    const attachments = await this.collectAttachments(e);
     await this.opts.router.handleMessage({
       channelId: e.channel,
       channelType,
@@ -174,7 +182,44 @@ export class SlackPlatform implements SlackSender {
       fromName: e.username ?? userId,
       isBot,
       text: e.text ?? "",
+      attachments,
     });
+  }
+
+  private async collectAttachments(e: any): Promise<InboundAttachment[]> {
+    const results: InboundAttachment[] = [];
+    const files = Array.isArray(e.files) ? e.files : [];
+    if (!files.length) return results;
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const headers = { authorization: `Bearer ${this.opts.config.botToken}` };
+
+    for (const f of files) {
+      const url = f?.url_private_download ?? f?.url_private;
+      if (!url) continue;
+      const mime: string | undefined = f.mimetype;
+      const name: string | undefined = f.name;
+      let kind = kindFromMime(mime);
+      // Slack voice memos surface as audio with subtype hints; the file
+      // type "vorbis" / "webm" with mode "transcription" is the strongest
+      // hint we can rely on without extra API calls.
+      if (kind === "audio" && (f.subtype === "slack_audio" || f.mode === "transcription")) {
+        kind = "voice";
+      }
+      const att = await downloadAttachment({
+        url,
+        headers,
+        scope: e.channel,
+        kind,
+        ext: extFromName(name) || (mime ? `.${mime.split("/").pop()}` : ""),
+        originalName: name,
+        mimeType: mime,
+        fileSize: typeof f.size === "number" ? f.size : undefined,
+        duration: typeof f.duration_ms === "number" ? Math.round(f.duration_ms / 1000) : undefined,
+        timestamp: ts,
+      });
+      if (att) results.push(att);
+    }
+    return results;
   }
 
   // --- REST outbound ---
