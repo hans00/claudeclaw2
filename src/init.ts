@@ -73,6 +73,10 @@ const SETTINGS_TEMPLATE = `{
     "host": "127.0.0.1",
     "port": 4632
   },
+  "messageStream": {
+    "//": "replace = delete reasoning/tool previews at end_turn (default); keep = leave them; off = suppress previews entirely",
+    "mode": "replace"
+  },
   "security": {
     "level": "moderate",
     "allowedTools": [],

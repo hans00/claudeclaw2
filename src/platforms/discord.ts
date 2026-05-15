@@ -64,6 +64,7 @@ export interface DiscordRouter {
 export interface DiscordSender {
   sendMessage(channelId: string, text: string): Promise<string | undefined>;
   editMessage(channelId: string, messageId: string, text: string): Promise<boolean>;
+  deleteMessage(channelId: string, messageId: string): Promise<boolean>;
   addReaction(channelId: string, messageId: string, emoji: string): Promise<void>;
   sendTypingAction(channelId: string): Promise<void>;
 }
@@ -353,6 +354,14 @@ export class DiscordPlatform implements DiscordSender {
     if (res.ok) return true;
     const body = await res.text().catch(() => "");
     console.error(`[discord] editMessage ${res.status}: ${body.slice(0, 200)}`);
+    return false;
+  }
+
+  async deleteMessage(channelId: string, messageId: string): Promise<boolean> {
+    const res = await this.rest("DELETE", `/channels/${channelId}/messages/${messageId}`);
+    if (res.ok || res.status === 204 || res.status === 404) return true;
+    const body = await res.text().catch(() => "");
+    console.error(`[discord] deleteMessage ${res.status}: ${body.slice(0, 200)}`);
     return false;
   }
 

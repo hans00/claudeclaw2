@@ -55,6 +55,21 @@ export interface WebConfig {
   port: number;
 }
 
+/**
+ * How to surface in-progress reasoning / tool calls during a turn vs. the
+ * final answer at end_turn.
+ *
+ *   "replace" (default) — show previews during the turn, delete them at
+ *                          end_turn so only the final bubble remains
+ *   "keep"             — leave previews visible after end_turn too
+ *   "off"              — no previews at all; only the final text is sent
+ */
+export type MessageStreamMode = "replace" | "keep" | "off";
+
+export interface MessageStreamConfig {
+  mode: MessageStreamMode;
+}
+
 export interface HeartbeatWindow {
   start: string; // "HH:MM"
   end: string;   // "HH:MM"; if end < start the window wraps midnight
@@ -87,6 +102,7 @@ export interface Settings {
   slack: SlackConfig;
   line: LineConfig;
   web: WebConfig;
+  messageStream: MessageStreamConfig;
   heartbeat: HeartbeatConfig;
   security: SecurityConfig;
   /** Default model (alias like "opus"/"sonnet" or full id). Empty = let Claude Code pick. */
@@ -114,6 +130,7 @@ const DEFAULTS: Settings = {
     allowedGroupIds: [],
   },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
+  messageStream: { mode: "replace" },
   heartbeat: { enabled: false, interval: 60, prompt: "", excludeWindows: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   model: "",
@@ -180,6 +197,12 @@ export async function loadSettings(): Promise<Settings> {
       enabled: typeof raw?.web?.enabled === "boolean" ? raw.web.enabled : DEFAULTS.web.enabled,
       host: typeof raw?.web?.host === "string" ? raw.web.host : DEFAULTS.web.host,
       port: typeof raw?.web?.port === "number" ? raw.web.port : DEFAULTS.web.port,
+    },
+    messageStream: {
+      mode: (() => {
+        const m = raw?.messageStream?.mode;
+        return m === "replace" || m === "keep" || m === "off" ? m : DEFAULTS.messageStream.mode;
+      })(),
     },
     security: {
       level: raw?.security?.level ?? DEFAULTS.security.level,

@@ -41,6 +41,7 @@ export interface SlackRouter {
 export interface SlackSender {
   sendMessage(channelId: string, text: string, threadTs?: string): Promise<string | undefined>;
   editMessage(channelId: string, ts: string, text: string): Promise<boolean>;
+  deleteMessage(channelId: string, ts: string): Promise<boolean>;
   addReaction(channelId: string, messageTs: string, emoji: string): Promise<void>;
   /** No-op on Slack — the Bot Web API has no "typing" equivalent. */
   sendTypingAction(channelId: string): Promise<void>;
@@ -257,6 +258,14 @@ export class SlackPlatform implements SlackSender {
     });
     if (res?.ok) return true;
     console.error(`[slack] chat.update failed:`, res?.error ?? res);
+    return false;
+  }
+
+  async deleteMessage(channelId: string, ts: string): Promise<boolean> {
+    const res = await this.web("chat.delete", { channel: channelId, ts });
+    if (res?.ok) return true;
+    if (res?.error === "message_not_found") return true;
+    console.error(`[slack] chat.delete failed:`, res?.error ?? res);
     return false;
   }
 

@@ -51,6 +51,8 @@ export interface LineSender {
   pushText(to: string, text: string): Promise<string | undefined>;
   /** Always returns false. LINE has no message-edit endpoint. */
   editMessage(to: string, messageId: string, text: string): Promise<boolean>;
+  /** Always returns false. LINE has no message-delete endpoint. */
+  deleteMessage(to: string, messageId: string): Promise<boolean>;
   sendReaction(messageId: string, emoji: string): Promise<void>;
   sendTypingAction(chatId: string): Promise<void>;
 }
@@ -251,6 +253,10 @@ export class LinePlatform implements LineSender {
 
   async editMessage(_to: string, _messageId: string, _text: string): Promise<boolean> {
     return false; // LINE has no message-edit endpoint
+  }
+
+  async deleteMessage(_to: string, _messageId: string): Promise<boolean> {
+    return false; // LINE has no message-delete endpoint
   }
 
   async sendTypingAction(chatId: string): Promise<void> {

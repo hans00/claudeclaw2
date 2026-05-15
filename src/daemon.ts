@@ -47,6 +47,11 @@ class Daemon {
    *  the same platform message instead of sending each segment as its own
    *  bubble. Reset on tool-use, turn-end, or when a new msg_id arrives. */
   private outbound = new Map<string, OutboundState>();
+  /** Per-channel list of preview bubbles (reasoning/tool/intermediate text)
+   *  that get deleted at turn-end when settings.messageStream.mode = "replace".
+   *  The currently-active bubble in `outbound` is NOT in this list — it
+   *  becomes a preview only when superseded by a new bubble. */
+  private previews = new Map<string, Array<{ replyTo: ReplyTarget; platformMsgId: string }>>();
   private telegram: TelegramPlatform | null = null;
   private discord: DiscordPlatform | null = null;
   private slack: SlackPlatform | null = null;
@@ -616,22 +621,7 @@ class Daemon {
         await this.dispatchReasoning(session, text, replyTo, claudeMsgId);
       },
       onTurnEnd: () => {
-        const state = this.outbound.get(session.channelKey);
-        // Flush any pending throttled edit synchronously so the final
-        // bubble content is delivered before we forget about it.
-        if (state?.pendingTimer && state.pendingText !== null && state.platformMsgId) {
-          clearTimeout(state.pendingTimer);
-          const text = state.pendingText;
-          const id = state.platformMsgId;
-          // Best-effort fire-and-forget; replyTo isn't tracked here so we
-          // re-derive from the most recent text dispatch. (For now just
-          // skip the flush — next edit will pick up the latest content.)
-          state.pendingTimer = null;
-          state.pendingText = null;
-          void this.flushPending(session.channelKey, id, text);
-        }
-        clearOutboundState(state);
-        this.outbound.delete(session.channelKey);
+        void this.finalizeTurn(session.channelKey);
       },
       onTyping: async (replyTo) => {
         await this.dispatchTyping(replyTo);
@@ -710,7 +700,9 @@ class Daemon {
         const ok = await this.editWithThrottle(state, replyTo, combined);
         if (!ok) {
           // Edit failed (text too long, platform refused, etc) — fall back
-          // to a fresh bubble for this segment.
+          // to a fresh bubble for this segment. The old bubble is now a
+          // preview (subject to messageStream.mode cleanup at turn-end).
+          this.archiveAsPreview(session.channelKey, state, replyTo);
           clearOutboundState(state);
           const newId = await this.platformSend(replyTo, textToSend);
           this.outbound.set(
@@ -719,6 +711,8 @@ class Daemon {
           );
         }
       } else {
+        // New bubble — the previous one (if any) becomes a preview.
+        this.archiveAsPreview(session.channelKey, state, replyTo);
         clearOutboundState(state);
         const newId = await this.platformSend(replyTo, textToSend);
         this.outbound.set(
@@ -763,20 +757,62 @@ class Daemon {
     return true;
   }
 
-  /** Force-flush a pending throttled edit (best-effort, no retry on fail). */
-  private async flushPending(
-    _channelKey: string,
-    _platformMsgId: string,
-    _text: string,
-  ): Promise<void> {
-    // No-op for now: replyTo isn't kept in OutboundState. The throttle
-    // timer (if not yet fired) will deliver the latest text shortly.
+  /**
+   * Stash the currently-active bubble (the one in OutboundState) as a
+   * preview, so it can be deleted at turn-end if mode = "replace". Called
+   * when a NEW bubble is about to take its place.
+   */
+  private archiveAsPreview(channelKey: string, state: OutboundState | undefined, replyTo: ReplyTarget): void {
+    if (!state || !state.platformMsgId || !replyTo) return;
+    let list = this.previews.get(channelKey);
+    if (!list) {
+      list = [];
+      this.previews.set(channelKey, list);
+    }
+    list.push({ replyTo, platformMsgId: state.platformMsgId });
+  }
+
+  /**
+   * Apply the configured messageStream.mode at turn-end:
+   *   "replace" — delete every preview bubble, leave the final one alone
+   *   "keep"    — keep everything visible
+   *   "off"     — same as replace (off currently means "no previews at all"
+   *               which is implemented as suppress-everything-except-final;
+   *               for now we also just delete them)
+   */
+  private async finalizeTurn(channelKey: string): Promise<void> {
+    const mode = this.settings.messageStream.mode;
+    const previews = this.previews.get(channelKey) ?? [];
+    this.previews.delete(channelKey);
+    const state = this.outbound.get(channelKey);
+    clearOutboundState(state);
+    this.outbound.delete(channelKey);
+    if (mode === "keep") return;
+    // Delete previews (replace + off both clear previews). Fire and forget.
+    for (const p of previews) {
+      void this.platformDelete(p.replyTo, p.platformMsgId);
+    }
+  }
+
+  private async platformDelete(replyTo: ReplyTarget, msgId: string): Promise<boolean> {
+    if (!replyTo) return false;
+    try {
+      if (replyTo.platform === "telegram") return (await this.telegram?.deleteMessage(replyTo.chatId, msgId)) ?? false;
+      if (replyTo.platform === "discord") return (await this.discord?.deleteMessage(replyTo.channelId, msgId)) ?? false;
+      if (replyTo.platform === "slack") return (await this.slack?.deleteMessage(replyTo.channelId, msgId)) ?? false;
+      if (replyTo.platform === "line") return false;
+    } catch (err) {
+      console.error(`[daemon] platformDelete failed:`, err instanceof Error ? err.message : err);
+    }
+    return false;
   }
 
   /**
    * Reasoning ("thinking") bubble. Shown before tool calls / final answer
    * when the model emits visible deliberation. Same edit-in-place + throttle
    * semantics as text/tool bubbles.
+   *
+   * Suppressed entirely when settings.messageStream.mode === "off".
    */
   private async dispatchReasoning(
     session: ChannelSession,
@@ -784,6 +820,7 @@ class Daemon {
     replyTo: ReplyTarget,
     claudeMsgId: string | undefined,
   ): Promise<void> {
+    if (this.settings.messageStream.mode === "off") return;
     if (!replyTo) {
       console.log(`[daemon] [${session.channelKey}] no replyTo — reasoning: ${text.slice(0, 200)}`);
       return;
@@ -798,9 +835,12 @@ class Daemon {
       state.accumulated = line;
       const ok = await this.editWithThrottle(state, replyTo, line);
       if (ok) return;
+      this.archiveAsPreview(session.channelKey, state, replyTo);
+      clearOutboundState(state);
+    } else if (state) {
+      this.archiveAsPreview(session.channelKey, state, replyTo);
       clearOutboundState(state);
     }
-    if (state) clearOutboundState(state);
     const newId = await this.platformSend(replyTo, line);
     this.outbound.set(
       session.channelKey,
@@ -819,6 +859,7 @@ class Daemon {
     result: string,
     replyTo: ReplyTarget,
   ): Promise<void> {
+    if (this.settings.messageStream.mode === "off") return;
     if (!replyTo) return;
     const state = this.outbound.get(session.channelKey);
     if (!state || state.kind !== "tool" || !state.platformMsgId) return;
@@ -841,6 +882,7 @@ class Daemon {
     input: unknown,
     replyTo: ReplyTarget,
   ): Promise<void> {
+    if (this.settings.messageStream.mode === "off") return;
     const line = formatToolStatus(toolName, input);
     if (!replyTo) {
       console.log(`[daemon] [${session.channelKey}] no replyTo — tool: ${line}`);
@@ -853,6 +895,11 @@ class Daemon {
       const ok = await this.editWithThrottle(state, replyTo, combined);
       if (ok) return;
       // Edit failed — start a fresh tool bubble for this line.
+      this.archiveAsPreview(session.channelKey, state, replyTo);
+      clearOutboundState(state);
+    } else if (state && state.kind !== "tool") {
+      // Switching from another kind into a tool bubble.
+      this.archiveAsPreview(session.channelKey, state, replyTo);
       clearOutboundState(state);
     }
     const newId = await this.platformSend(replyTo, line);

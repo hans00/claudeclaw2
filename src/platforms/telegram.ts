@@ -96,6 +96,8 @@ export interface TelegramSender {
   /** Replace an already-sent message's content. Returns true on success;
    *  false if the new text would be multi-chunk or the API rejects. */
   editMessage(chatId: number, messageId: string, text: string): Promise<boolean>;
+  /** Delete a previously-sent message. Returns true on success. */
+  deleteMessage(chatId: number, messageId: string): Promise<boolean>;
   setReactions(chatId: number, messageId: number, emojis: string[]): Promise<void>;
   sendTypingAction(chatId: number): Promise<void>;
 }
@@ -212,6 +214,24 @@ export class TelegramPlatform implements TelegramSender {
    * (custom emojis, newer additions, etc) is dropped here with a warning
    * rather than burning the whole reaction batch on a 400.
    */
+  async deleteMessage(chatId: number, messageId: string): Promise<boolean> {
+    const token = this.opts.config.token;
+    if (!token) return false;
+    const id = Number(messageId);
+    if (!Number.isFinite(id)) return false;
+    const res = await fetch(`${API_BASE}/bot${token}/deleteMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, message_id: id }),
+    });
+    if (res.ok) return true;
+    const body = await res.text().catch(() => "");
+    // Already deleted / not found is acceptable.
+    if (body.includes("message to delete not found")) return true;
+    console.error(`[telegram] deleteMessage failed (${res.status}): ${body.slice(0, 200)}`);
+    return false;
+  }
+
   async sendTypingAction(chatId: number): Promise<void> {
     const token = this.opts.config.token;
     if (!token) return;
