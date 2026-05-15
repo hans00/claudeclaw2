@@ -73,6 +73,15 @@ export async function killSession(name: string): Promise<void> {
   if (r.exitCode !== 0 && !r.stderr.includes("can't find session")) fail(args, r);
 }
 
+/** Rename an existing tmux session. Returns false if the source doesn't exist. */
+export async function renameSession(from: string, to: string): Promise<boolean> {
+  const args = [TMUX, "rename-session", "-t", from, to];
+  const r = await run(args);
+  if (r.exitCode === 0) return true;
+  if (r.stderr.includes("can't find session") || r.stderr.includes("no such session")) return false;
+  fail(args, r);
+}
+
 /**
  * Send key sequence(s). Each element is one tmux key argument — special keys
  * like "Enter", "Escape", "Down", "C-c", or a literal text string.

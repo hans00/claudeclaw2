@@ -63,7 +63,7 @@ async function main(): Promise<void> {
     kind: "global",
     channelKey,
     sessionId: randomUUID(),
-    tmuxSession: tmuxNameFor(channelKey),
+    tmuxSession: tmuxNameFor(channelKey, process.cwd()),
     multiparty: false,
     createdAt: new Date().toISOString(),
     lastActivityAt: new Date().toISOString(),

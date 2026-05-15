@@ -7,6 +7,7 @@
  * machine — losing it on restart is fine because the channel just starts
  * fresh and the user's next message kicks it off.
  */
+import { createHash } from "crypto";
 import { mkdir, readFile, rename, writeFile } from "fs/promises";
 import { dirname, join } from "path";
 
@@ -93,11 +94,22 @@ export function channelKey(kind: ChannelKind, id: string): string {
 }
 
 /**
- * Derive a deterministic tmux session name from a channel key. Replaces
- * characters tmux dislikes in session names (`.`, `:`) and keeps the name
- * readable for `tmux ls` debugging.
+ * Short stable hash of an absolute project directory. Used as the prefix
+ * of every tmux session name so two daemons running from different
+ * project roots on the same host don't collide on names like
+ * "claudeclaw-global".
  */
-export function tmuxNameFor(channelKey: string): string {
+export function projectHash(projectDir: string): string {
+  return createHash("sha256").update(projectDir).digest("hex").slice(0, 8);
+}
+
+/**
+ * Derive a deterministic tmux session name from a channel key + project
+ * dir. `claudeclaw-<8-char project hash>-<safe channel key>`. The project
+ * hash isolates concurrent daemons; the channel key keeps the name
+ * readable in `tmux ls`.
+ */
+export function tmuxNameFor(channelKey: string, projectDir: string): string {
   const safe = channelKey.replace(/[^a-zA-Z0-9_-]/g, "-");
-  return `claudeclaw-${safe}`;
+  return `claudeclaw-${projectHash(projectDir)}-${safe}`;
 }

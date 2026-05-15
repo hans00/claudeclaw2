@@ -23,11 +23,14 @@ const SETTINGS_PATH = join(".claude", "claudeclaw", "settings.json");
 import {
   GLOBAL_KEY,
   loadSessions,
+  saveSessions,
   touchActivity,
   tmuxNameFor,
   upsertSession,
   type ChannelSession,
+  type SessionMap,
 } from "./sessions";
+import { renameSession } from "./tmux";
 import { TelegramPlatform, type InboundMessage, type TelegramRouter } from "./platforms/telegram";
 import { composePromptWithAttachments } from "./attachments";
 import { DiscordPlatform, type DiscordInbound, type DiscordRouter } from "./platforms/discord";
@@ -275,6 +278,9 @@ class Daemon {
       return;
     }
     console.log(`[daemon] restoring ${keys.length} session(s)...`);
+    // Migrate any pre-projectHash tmux session names to the new format.
+    await this.migrateTmuxNames(persisted);
+
     for (const [key, session] of Object.entries(persisted)) {
       if (
         session.kind !== "global" &&
@@ -291,6 +297,32 @@ class Daemon {
         console.error(`[daemon] failed to restore ${key}:`, err);
       }
     }
+  }
+
+  /**
+   * Old sessions.json entries had tmuxSession names like "claudeclaw-global"
+   * with no project-hash prefix. Two daemons in different project roots
+   * would collide on those. Rename existing tmux sessions to the new
+   * `claudeclaw-<projectHash>-<key>` format and update the persisted state.
+   */
+  private async migrateTmuxNames(persisted: SessionMap): Promise<void> {
+    let dirty = false;
+    for (const [key, session] of Object.entries(persisted)) {
+      const expected = tmuxNameFor(key, this.projectDir);
+      if (session.tmuxSession === expected) continue;
+      const oldName = session.tmuxSession;
+      try {
+        const renamed = await renameSession(oldName, expected);
+        if (renamed) {
+          console.log(`[daemon] renamed tmux session ${oldName} → ${expected}`);
+        }
+      } catch (err) {
+        console.warn(`[daemon] could not rename ${oldName} → ${expected}:`, err);
+      }
+      session.tmuxSession = expected;
+      dirty = true;
+    }
+    if (dirty) await saveSessions(persisted);
   }
 
   private async startTelegram(): Promise<void> {
@@ -548,7 +580,7 @@ class Daemon {
       kind,
       channelKey: key,
       sessionId: randomUUID(),
-      tmuxSession: tmuxNameFor(key),
+      tmuxSession: tmuxNameFor(key, this.projectDir),
       multiparty,
       createdAt: now,
       lastActivityAt: now,
