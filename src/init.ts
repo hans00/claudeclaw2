@@ -79,6 +79,11 @@ const SETTINGS_TEMPLATE = `{
     "host": "127.0.0.1",
     "port": 4632
   },
+  "sessionCleanup": {
+    "//": "Tear down tmux + agent for channels idle past idleTimeoutHours. sessions.json entry stays so the next inbound restores the context. Set idleTimeoutHours: 0 to disable.",
+    "idleTimeoutHours": 168,
+    "checkIntervalMinutes": 30
+  },
   "security": {
     "level": "moderate",
     "allowedTools": [],

@@ -59,6 +59,7 @@ class Daemon {
   private cron: CronScheduler | null = null;
   private heartbeat: HeartbeatScheduler | null = null;
   private statusline: StatuslineWriter | null = null;
+  private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private web: WebServer | null = null;
   private projectDir = process.cwd();
   private startedAt = Date.now();
@@ -79,6 +80,7 @@ class Daemon {
     this.startHeartbeat();
     this.startStatusline();
     this.startWeb();
+    this.startSessionCleanup();
     this.watchSettings();
     this.installSignalHandlers();
     console.log(`[daemon] ready (project=${this.projectDir})`);
@@ -202,6 +204,65 @@ class Daemon {
       });
     }
     return result;
+  }
+
+  /**
+   * Periodically tear down tmux sessions whose channel has been idle past
+   * settings.sessionCleanup.idleTimeoutHours. The sessions.json entry stays
+   * so the next inbound restores the conversation via `claude --resume`.
+   */
+  private startSessionCleanup(): void {
+    const cfg = this.settings.sessionCleanup;
+    if (cfg.idleTimeoutHours <= 0 || cfg.checkIntervalMinutes <= 0) {
+      console.log("[daemon] session cleanup disabled");
+      return;
+    }
+    // Run once on start to catch sessions that were already idle when we
+    // booted, then on the configured interval.
+    void this.cleanupIdleSessions();
+    this.cleanupTimer = setInterval(
+      () => void this.cleanupIdleSessions(),
+      cfg.checkIntervalMinutes * 60_000,
+    );
+    console.log(
+      `[daemon] session cleanup scheduler: idleTimeout=${cfg.idleTimeoutHours}h, ` +
+        `check every ${cfg.checkIntervalMinutes}m`,
+    );
+  }
+
+  private async cleanupIdleSessions(): Promise<void> {
+    const timeoutMs = this.settings.sessionCleanup.idleTimeoutHours * 3_600_000;
+    if (timeoutMs <= 0) return;
+    const now = Date.now();
+    const candidates: Array<{ key: string; ageMs: number }> = [];
+    for (const [key, channel] of this.channels.entries()) {
+      if (channel.currentState !== "idle") continue;
+      const lastTs = Date.parse(channel.session.lastActivityAt);
+      if (!Number.isFinite(lastTs)) continue;
+      const age = now - lastTs;
+      if (age >= timeoutMs) candidates.push({ key, ageMs: age });
+    }
+    if (candidates.length === 0) return;
+    console.log(`[daemon] cleaning up ${candidates.length} idle channel(s)`);
+    for (const { key, ageMs } of candidates) {
+      const channel = this.channels.get(key);
+      if (!channel) continue;
+      const hours = Math.round(ageMs / 3_600_000);
+      console.log(`[daemon]   ${key} idle for ${hours}h → killing tmux`);
+      try {
+        await channel.shutdown();
+      } catch (err) {
+        console.error(`[daemon] cleanup ${key}:`, err);
+      }
+      // Also drop any in-flight outbound state for the channel.
+      const outbound = this.outbound.get(key);
+      if (outbound) {
+        clearOutboundState(outbound);
+        this.outbound.delete(key);
+      }
+      this.previews.delete(key);
+      this.channels.delete(key);
+    }
   }
 
   private startStatusline(): void {
@@ -582,6 +643,25 @@ class Daemon {
   ): Promise<Channel | null> {
     let channel = this.channels.get(key);
     if (channel) return channel;
+
+    // Restore from sessions.json if we have a persisted entry — keeps the
+    // claude conversation context across cleanup/restart cycles.
+    const persisted = await loadSessions();
+    const existing = persisted[key];
+    if (existing) {
+      channel = this.makeChannel(existing);
+      this.channels.set(key, channel);
+      console.log(`[daemon] restoring cold channel ${key} (sessionId ${existing.sessionId.slice(0, 8)})`);
+      try {
+        await channel.start({ resume: true });
+      } catch (err) {
+        console.error(`[daemon] failed to restore ${key}:`, err);
+        this.channels.delete(key);
+        return null;
+      }
+      return channel;
+    }
+
     const now = new Date().toISOString();
     const session: ChannelSession = {
       kind,
@@ -1054,6 +1134,8 @@ class Daemon {
     this.cron?.stop();
     this.heartbeat?.stop();
     this.statusline?.stop();
+    if (this.cleanupTimer) clearInterval(this.cleanupTimer);
+    this.cleanupTimer = null;
     this.web?.stop();
     if (this.telegram) await this.telegram.stop();
     if (this.discord) await this.discord.stop();
