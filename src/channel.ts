@@ -525,9 +525,12 @@ export class Channel {
       // get treated as a turn boundary or forwarded to the platform.
       this.expectingModelEcho = true;
       await sendKeys(target, `/model ${routed.model}`);
-      await new Promise((r) => setTimeout(r, 250));
+      await new Promise((r) => setTimeout(r, 150));
       await pressEnter(target);
-      await new Promise((r) => setTimeout(r, 300));
+      // /model is client-side and fast, but the TUI needs time to clear the
+      // input box and become ready for the next paste — short waits caused a
+      // race where pressEnter for the user prompt landed on an empty input.
+      await new Promise((r) => setTimeout(r, 700));
       this.currentModel = routed.model;
     } catch (err) {
       this.expectingModelEcho = false;
