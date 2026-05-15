@@ -90,7 +90,12 @@ export interface TelegramRouter {
 }
 
 export interface TelegramSender {
-  sendMessage(chatId: number, text: string): Promise<void>;
+  /** Send `text` (markdown → HTML, chunked). Returns the message_id of the
+   *  FIRST chunk (the one we'd edit-in-place) or undefined on failure. */
+  sendMessage(chatId: number, text: string): Promise<string | undefined>;
+  /** Replace an already-sent message's content. Returns true on success;
+   *  false if the new text would be multi-chunk or the API rejects. */
+  editMessage(chatId: number, messageId: string, text: string): Promise<boolean>;
   setReactions(chatId: number, messageId: number, emojis: string[]): Promise<void>;
   sendTypingAction(chatId: number): Promise<void>;
 }
@@ -128,15 +133,12 @@ export class TelegramPlatform implements TelegramSender {
     console.log("[telegram] stopped");
   }
 
-  async sendMessage(chatId: number, text: string): Promise<void> {
+  async sendMessage(chatId: number, text: string): Promise<string | undefined> {
     const token = this.opts.config.token;
-    if (!token || !text) return;
-    // Convert first, then chunk on HTML paragraph boundaries so the splits
-    // never land inside a <pre>/<b>/<code> tag. Markdown→HTML can expand
-    // length 1.3–1.5x, so chunking the raw markdown was overrunning the
-    // 4096 limit once `<b>`, `<code>`, table padding etc were added.
+    if (!token || !text) return undefined;
     const html = markdownToTelegramHtml(text);
     const chunks = chunkHtml(html, TG_HTML_LIMIT);
+    let firstId: string | undefined;
     for (const chunk of chunks) {
       const res = await fetch(`${API_BASE}/bot${token}/sendMessage`, {
         method: "POST",
@@ -148,23 +150,57 @@ export class TelegramPlatform implements TelegramSender {
           disable_web_page_preview: true,
         }),
       });
-      if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        console.error(`[telegram] sendMessage failed (${res.status}): ${body.slice(0, 200)}`);
-        // Fallback: retry as plain text in case the HTML payload broke
-        // (unbalanced tags from weird markdown, etc).
-        const plainRes = await fetch(`${API_BASE}/bot${token}/sendMessage`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ chat_id: chatId, text: chunk.slice(0, 4000), disable_web_page_preview: true }),
-        });
-        if (!plainRes.ok) {
-          const b = await plainRes.text().catch(() => "");
-          console.error(`[telegram] plain fallback also failed (${plainRes.status}): ${b.slice(0, 200)}`);
-        }
-        return;
+      if (res.ok) {
+        const data: any = await res.json().catch(() => null);
+        const id = data?.result?.message_id;
+        if (firstId === undefined && typeof id === "number") firstId = String(id);
+        continue;
+      }
+      const body = await res.text().catch(() => "");
+      console.error(`[telegram] sendMessage failed (${res.status}): ${body.slice(0, 200)}`);
+      // Fallback: retry as plain text in case the HTML payload broke
+      const plainRes = await fetch(`${API_BASE}/bot${token}/sendMessage`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, text: chunk.slice(0, 4000), disable_web_page_preview: true }),
+      });
+      if (plainRes.ok) {
+        const data: any = await plainRes.json().catch(() => null);
+        const id = data?.result?.message_id;
+        if (firstId === undefined && typeof id === "number") firstId = String(id);
+      } else {
+        const b = await plainRes.text().catch(() => "");
+        console.error(`[telegram] plain fallback also failed (${plainRes.status}): ${b.slice(0, 200)}`);
       }
     }
+    return firstId;
+  }
+
+  async editMessage(chatId: number, messageId: string, text: string): Promise<boolean> {
+    const token = this.opts.config.token;
+    if (!token) return false;
+    const id = Number(messageId);
+    if (!Number.isFinite(id)) return false;
+    const html = markdownToTelegramHtml(text);
+    const chunks = chunkHtml(html, TG_HTML_LIMIT);
+    if (chunks.length !== 1) return false; // multi-chunk edits unsupported
+    const res = await fetch(`${API_BASE}/bot${token}/editMessageText`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: id,
+        text: chunks[0],
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      }),
+    });
+    if (res.ok) return true;
+    const body = await res.text().catch(() => "");
+    // "message is not modified" is harmless — same content, treat as success.
+    if (body.includes("message is not modified")) return true;
+    console.error(`[telegram] editMessage failed (${res.status}): ${body.slice(0, 200)}`);
+    return false;
   }
 
   /**

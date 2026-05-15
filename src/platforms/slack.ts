@@ -39,7 +39,8 @@ export interface SlackRouter {
 }
 
 export interface SlackSender {
-  sendMessage(channelId: string, text: string, threadTs?: string): Promise<void>;
+  sendMessage(channelId: string, text: string, threadTs?: string): Promise<string | undefined>;
+  editMessage(channelId: string, ts: string, text: string): Promise<boolean>;
   addReaction(channelId: string, messageTs: string, emoji: string): Promise<void>;
   /** No-op on Slack — the Bot Web API has no "typing" equivalent. */
   sendTypingAction(channelId: string): Promise<void>;
@@ -226,9 +227,10 @@ export class SlackPlatform implements SlackSender {
 
   // --- REST outbound ---
 
-  async sendMessage(channelId: string, text: string, threadTs?: string): Promise<void> {
-    if (!text) return;
+  async sendMessage(channelId: string, text: string, threadTs?: string): Promise<string | undefined> {
+    if (!text) return undefined;
     const chunks = chunkText(text);
+    let firstTs: string | undefined;
     for (const chunk of chunks) {
       const res = await this.web("chat.postMessage", {
         channel: channelId,
@@ -237,9 +239,25 @@ export class SlackPlatform implements SlackSender {
       });
       if (!res?.ok) {
         console.error(`[slack] chat.postMessage failed:`, res?.error ?? res);
-        return;
+        continue;
       }
+      if (firstTs === undefined && typeof res.ts === "string") firstTs = res.ts;
     }
+    return firstTs;
+  }
+
+  async editMessage(channelId: string, ts: string, text: string): Promise<boolean> {
+    if (!text) return false;
+    const chunks = chunkText(text);
+    if (chunks.length !== 1) return false;
+    const res = await this.web("chat.update", {
+      channel: channelId,
+      ts,
+      text: chunks[0],
+    });
+    if (res?.ok) return true;
+    console.error(`[slack] chat.update failed:`, res?.error ?? res);
+    return false;
   }
 
   async sendTypingAction(_channelId: string): Promise<void> {

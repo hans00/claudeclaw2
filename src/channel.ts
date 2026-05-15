@@ -46,8 +46,11 @@ export type ReplyTarget =
   | null;
 
 export interface ChannelCallbacks {
-  /** Post a finished assistant text segment to the platform. */
-  onAssistantText(text: string, replyTo: ReplyTarget): Promise<void> | void;
+  /** Post a finished assistant text segment to the platform. `claudeMsgId`
+   *  is Claude Code's stable id for this assistant "bubble" — segments that
+   *  share the same id should be edited-in-place when the platform supports
+   *  it; a different id means a new bubble (e.g. after a tool result). */
+  onAssistantText(text: string, replyTo: ReplyTarget, claudeMsgId?: string): Promise<void> | void;
   /** Post a tool-call status indicator (e.g. "🛠 Bash: echo hi"). */
   onToolUse(toolName: string, input: unknown, replyTo: ReplyTarget): Promise<void> | void;
   /** Optional: invoked when the channel becomes idle after a turn ends. */
@@ -307,7 +310,7 @@ export class Channel {
       switch (ev.type) {
         case "assistant-text":
           if (ev.text && ev.text.trim()) {
-            await this.opts.callbacks.onAssistantText(ev.text, this.currentTurnReplyTo);
+            await this.opts.callbacks.onAssistantText(ev.text, this.currentTurnReplyTo, ev.msgId);
           }
           break;
         case "assistant-tool-use":

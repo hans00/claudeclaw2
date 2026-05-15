@@ -46,7 +46,11 @@ export interface LineRouter {
 }
 
 export interface LineSender {
-  pushText(to: string, text: string): Promise<void>;
+  /** LINE messages cannot be edited — always sends new. Returns undefined
+   *  (no useful per-message id for editing). */
+  pushText(to: string, text: string): Promise<string | undefined>;
+  /** Always returns false. LINE has no message-edit endpoint. */
+  editMessage(to: string, messageId: string, text: string): Promise<boolean>;
   sendReaction(messageId: string, emoji: string): Promise<void>;
   sendTypingAction(chatId: string): Promise<void>;
 }
@@ -228,8 +232,8 @@ export class LinePlatform implements LineSender {
 
   // --- Outbound ---
 
-  async pushText(to: string, text: string): Promise<void> {
-    if (!text) return;
+  async pushText(to: string, text: string): Promise<string | undefined> {
+    if (!text) return undefined;
     const chunks = chunkText(text);
     for (const chunk of chunks) {
       const res = await this.api(`/bot/message/push`, "POST", {
@@ -239,9 +243,14 @@ export class LinePlatform implements LineSender {
       if (!res?.ok) {
         const body = await res?.text().catch(() => "");
         console.error(`[line] pushText failed (${res?.status}): ${body?.slice(0, 200)}`);
-        return;
+        return undefined;
       }
     }
+    return undefined; // LINE doesn't surface useful per-message ids on push
+  }
+
+  async editMessage(_to: string, _messageId: string, _text: string): Promise<boolean> {
+    return false; // LINE has no message-edit endpoint
   }
 
   async sendTypingAction(chatId: string): Promise<void> {

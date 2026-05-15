@@ -35,6 +35,11 @@ import { WebServer, type SessionView, type WebDaemonView } from "./web";
 
 class Daemon {
   private channels = new Map<string, Channel>();
+  /** Per-channel outbound state for edit-in-place: while consecutive
+   *  assistant-text events share the same Claude msg_id, we keep editing
+   *  the same platform message instead of sending each segment as its own
+   *  bubble. Reset on tool-use, turn-end, or when a new msg_id arrives. */
+  private outbound = new Map<string, OutboundState>();
   private telegram: TelegramPlatform | null = null;
   private discord: DiscordPlatform | null = null;
   private slack: SlackPlatform | null = null;
@@ -470,11 +475,17 @@ class Daemon {
 
   private makeChannel(session: ChannelSession): Channel {
     const callbacks: ChannelCallbacks = {
-      onAssistantText: async (text, replyTo) => {
-        await this.dispatchOutbound(session, text, replyTo);
+      onAssistantText: async (text, replyTo, claudeMsgId) => {
+        await this.dispatchAssistantText(session, text, replyTo, claudeMsgId);
       },
       onToolUse: async (toolName, input, replyTo) => {
+        // Tool messages always start a new bubble — edit-in-place doesn't
+        // span tool calls, otherwise the message order looks confusing.
+        this.outbound.delete(session.channelKey);
         await this.dispatchOutbound(session, formatToolStatus(toolName, input), replyTo);
+      },
+      onTurnEnd: () => {
+        this.outbound.delete(session.channelKey);
       },
       onTyping: async (replyTo) => {
         await this.dispatchTyping(replyTo);
@@ -503,6 +514,100 @@ class Daemon {
       else if (replyTo.platform === "line") await this.line?.sendTypingAction(replyTo.to);
     } catch (err) {
       console.error(`[daemon] typing dispatch failed:`, err instanceof Error ? err.message : err);
+    }
+  }
+
+  /**
+   * Edit-in-place when the assistant emits consecutive text segments with
+   * the same Claude msg_id; otherwise send a new platform message and
+   * remember the id for the next segment.
+   */
+  private async dispatchAssistantText(
+    session: ChannelSession,
+    text: string,
+    replyTo: ReplyTarget,
+    claudeMsgId: string | undefined,
+  ): Promise<void> {
+    const { cleanText, reactions } = extractReactions(text);
+    if (!replyTo) {
+      if (cleanText) {
+        console.log(`[daemon] [${session.channelKey}] no replyTo — logging only:\n${cleanText.slice(0, 500)}`);
+      }
+      return;
+    }
+    if (!cleanText && reactions.length === 0) return;
+
+    if (cleanText) {
+      const state = this.outbound.get(session.channelKey);
+      const sameBubble = !!claudeMsgId && state?.claudeMsgId === claudeMsgId && !!state.platformMsgId;
+      if (sameBubble && state) {
+        const combined = `${state.accumulated}\n\n${cleanText}`;
+        const ok = await this.platformEdit(replyTo, state.platformMsgId!, combined);
+        if (ok) {
+          state.accumulated = combined;
+        } else {
+          // Edit failed (text too long, platform refused, etc) — fall back
+          // to a fresh bubble for this segment.
+          const newId = await this.platformSend(replyTo, cleanText);
+          this.outbound.set(session.channelKey, {
+            claudeMsgId,
+            platformMsgId: newId,
+            accumulated: cleanText,
+          });
+        }
+      } else {
+        const newId = await this.platformSend(replyTo, cleanText);
+        this.outbound.set(session.channelKey, {
+          claudeMsgId,
+          platformMsgId: newId,
+          accumulated: cleanText,
+        });
+      }
+    }
+
+    await this.applyReactions(replyTo, reactions);
+  }
+
+  private async platformSend(replyTo: ReplyTarget, text: string): Promise<string | undefined> {
+    if (!replyTo) return undefined;
+    try {
+      if (replyTo.platform === "telegram") return await this.telegram?.sendMessage(replyTo.chatId, text);
+      if (replyTo.platform === "discord") return await this.discord?.sendMessage(replyTo.channelId, text);
+      if (replyTo.platform === "slack") return await this.slack?.sendMessage(replyTo.channelId, text, replyTo.threadTs);
+      if (replyTo.platform === "line") return await this.line?.pushText(replyTo.to, text);
+    } catch (err) {
+      console.error(`[daemon] platformSend failed:`, err instanceof Error ? err.message : err);
+    }
+    return undefined;
+  }
+
+  private async platformEdit(replyTo: ReplyTarget, msgId: string, text: string): Promise<boolean> {
+    if (!replyTo) return false;
+    try {
+      if (replyTo.platform === "telegram") return (await this.telegram?.editMessage(replyTo.chatId, msgId, text)) ?? false;
+      if (replyTo.platform === "discord") return (await this.discord?.editMessage(replyTo.channelId, msgId, text)) ?? false;
+      if (replyTo.platform === "slack") return (await this.slack?.editMessage(replyTo.channelId, msgId, text)) ?? false;
+      if (replyTo.platform === "line") return false; // line has no edit endpoint
+    } catch (err) {
+      console.error(`[daemon] platformEdit failed:`, err instanceof Error ? err.message : err);
+    }
+    return false;
+  }
+
+  private async applyReactions(replyTo: ReplyTarget, reactions: string[]): Promise<void> {
+    if (!replyTo || reactions.length === 0) return;
+    try {
+      if (replyTo.platform === "telegram" && replyTo.messageId !== undefined) {
+        await this.telegram?.setReactions(replyTo.chatId, replyTo.messageId, reactions);
+      } else if (replyTo.platform === "discord" && replyTo.messageId) {
+        for (const e of reactions) await this.discord?.addReaction(replyTo.channelId, replyTo.messageId, e);
+      } else if (replyTo.platform === "slack" && replyTo.messageTs) {
+        for (const e of reactions) await this.slack?.addReaction(replyTo.channelId, replyTo.messageTs, e);
+      } else if (replyTo.platform === "line" && replyTo.messageId) {
+        for (const e of reactions) await this.line?.sendReaction(replyTo.messageId, e);
+      }
+    } catch (err) {
+      console.error(`[daemon] applyReactions failed:`, err instanceof Error ? err.message : err);
     }
   }
 
@@ -588,6 +693,15 @@ class Daemon {
     }
     process.exit(0);
   }
+}
+
+interface OutboundState {
+  /** Claude Code message.id whose segments we're accumulating. */
+  claudeMsgId: string | undefined;
+  /** Platform-side id of the message we'd edit (string for portability). */
+  platformMsgId: string | undefined;
+  /** Combined text we've sent so far for this bubble; basis for next edit. */
+  accumulated: string;
 }
 
 function deriveKindFromKey(

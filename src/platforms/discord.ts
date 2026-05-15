@@ -62,7 +62,8 @@ export interface DiscordRouter {
 }
 
 export interface DiscordSender {
-  sendMessage(channelId: string, text: string): Promise<void>;
+  sendMessage(channelId: string, text: string): Promise<string | undefined>;
+  editMessage(channelId: string, messageId: string, text: string): Promise<boolean>;
   addReaction(channelId: string, messageId: string, emoji: string): Promise<void>;
   sendTypingAction(channelId: string): Promise<void>;
 }
@@ -323,17 +324,36 @@ export class DiscordPlatform implements DiscordSender {
 
   // --- REST outbound ---
 
-  async sendMessage(channelId: string, text: string): Promise<void> {
-    if (!text) return;
+  async sendMessage(channelId: string, text: string): Promise<string | undefined> {
+    if (!text) return undefined;
     const chunks = chunkText(text);
+    let firstId: string | undefined;
     for (const chunk of chunks) {
       const res = await this.rest("POST", `/channels/${channelId}/messages`, { content: chunk });
       if (!res.ok) {
         const body = await res.text().catch(() => "");
         console.error(`[discord] sendMessage ${res.status}: ${body.slice(0, 200)}`);
-        return;
+        continue;
       }
+      const data: any = await res.json().catch(() => null);
+      if (firstId === undefined && typeof data?.id === "string") firstId = data.id;
     }
+    return firstId;
+  }
+
+  async editMessage(channelId: string, messageId: string, text: string): Promise<boolean> {
+    if (!text) return false;
+    const chunks = chunkText(text);
+    if (chunks.length !== 1) return false;
+    const res = await this.rest(
+      "PATCH",
+      `/channels/${channelId}/messages/${messageId}`,
+      { content: chunks[0] },
+    );
+    if (res.ok) return true;
+    const body = await res.text().catch(() => "");
+    console.error(`[discord] editMessage ${res.status}: ${body.slice(0, 200)}`);
+    return false;
   }
 
   async sendTypingAction(channelId: string): Promise<void> {
