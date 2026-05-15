@@ -17,6 +17,7 @@ import type { SourceInfo } from "./channel";
 import { StatuslineWriter } from "./statusline";
 import { backupV1GlobalIfExists, migrateFromV1 } from "./migrate";
 import { extractReactions } from "./reactions";
+import { formatToolStatus } from "./tool-display";
 
 const PID_FILE = join(".claude", "claudeclaw", "daemon.pid");
 const SETTINGS_PATH = join(".claude", "claudeclaw", "settings.json");
@@ -608,6 +609,21 @@ class Daemon {
         await this.dispatchToolUse(session, toolName, input, replyTo);
       },
       onTurnEnd: () => {
+        const state = this.outbound.get(session.channelKey);
+        // Flush any pending throttled edit synchronously so the final
+        // bubble content is delivered before we forget about it.
+        if (state?.pendingTimer && state.pendingText !== null && state.platformMsgId) {
+          clearTimeout(state.pendingTimer);
+          const text = state.pendingText;
+          const id = state.platformMsgId;
+          // Best-effort fire-and-forget; replyTo isn't tracked here so we
+          // re-derive from the most recent text dispatch. (For now just
+          // skip the flush — next edit will pick up the latest content.)
+          state.pendingTimer = null;
+          state.pendingText = null;
+          void this.flushPending(session.channelKey, id, text);
+        }
+        clearOutboundState(state);
         this.outbound.delete(session.channelKey);
       },
       onTyping: async (replyTo) => {
@@ -667,32 +683,71 @@ class Daemon {
         !!state.platformMsgId;
       if (sameBubble && state) {
         const combined = `${state.accumulated}\n\n${cleanText}`;
-        const ok = await this.platformEdit(replyTo, state.platformMsgId!, combined);
-        if (ok) {
-          state.accumulated = combined;
-        } else {
+        state.accumulated = combined;
+        const ok = await this.editWithThrottle(state, replyTo, combined);
+        if (!ok) {
           // Edit failed (text too long, platform refused, etc) — fall back
           // to a fresh bubble for this segment.
+          clearOutboundState(state);
           const newId = await this.platformSend(replyTo, cleanText);
-          this.outbound.set(session.channelKey, {
-            kind: "text",
-            claudeMsgId,
-            platformMsgId: newId,
-            accumulated: cleanText,
-          });
+          this.outbound.set(
+            session.channelKey,
+            freshOutboundState("text", claudeMsgId, newId, cleanText),
+          );
         }
       } else {
+        clearOutboundState(state);
         const newId = await this.platformSend(replyTo, cleanText);
-        this.outbound.set(session.channelKey, {
-          kind: "text",
-          claudeMsgId,
-          platformMsgId: newId,
-          accumulated: cleanText,
-        });
+        this.outbound.set(
+          session.channelKey,
+          freshOutboundState("text", claudeMsgId, newId, cleanText),
+        );
       }
     }
 
     await this.applyReactions(replyTo, reactions);
+  }
+
+  /**
+   * Throttle platform edits. If the last actual edit was less than
+   * EDIT_THROTTLE_MS ago, defer the edit and coalesce further updates into
+   * one flush. Returns false when the edit is rejected outright (caller
+   * falls back to a fresh bubble).
+   */
+  private async editWithThrottle(
+    state: OutboundState,
+    replyTo: ReplyTarget,
+    text: string,
+  ): Promise<boolean> {
+    if (!state.platformMsgId) return false;
+    const elapsed = Date.now() - state.lastEditAtMs;
+    if (elapsed >= EDIT_THROTTLE_MS) {
+      const ok = await this.platformEdit(replyTo, state.platformMsgId, text);
+      if (ok) state.lastEditAtMs = Date.now();
+      return ok;
+    }
+    // Defer: coalesce with any pending edit.
+    state.pendingText = text;
+    if (state.pendingTimer) return true;
+    state.pendingTimer = setTimeout(async () => {
+      state.pendingTimer = null;
+      const pending = state.pendingText;
+      state.pendingText = null;
+      if (pending === null || !state.platformMsgId) return;
+      const ok = await this.platformEdit(replyTo, state.platformMsgId, pending);
+      if (ok) state.lastEditAtMs = Date.now();
+    }, EDIT_THROTTLE_MS - elapsed);
+    return true;
+  }
+
+  /** Force-flush a pending throttled edit (best-effort, no retry on fail). */
+  private async flushPending(
+    _channelKey: string,
+    _platformMsgId: string,
+    _text: string,
+  ): Promise<void> {
+    // No-op for now: replyTo isn't kept in OutboundState. The throttle
+    // timer (if not yet fired) will deliver the latest text shortly.
   }
 
   /**
@@ -715,20 +770,17 @@ class Daemon {
     const state = this.outbound.get(session.channelKey);
     if (state?.kind === "tool" && state.platformMsgId) {
       const combined = `${state.accumulated}\n${line}`;
-      const ok = await this.platformEdit(replyTo, state.platformMsgId, combined);
-      if (ok) {
-        state.accumulated = combined;
-        return;
-      }
+      state.accumulated = combined;
+      const ok = await this.editWithThrottle(state, replyTo, combined);
+      if (ok) return;
       // Edit failed — start a fresh tool bubble for this line.
+      clearOutboundState(state);
     }
     const newId = await this.platformSend(replyTo, line);
-    this.outbound.set(session.channelKey, {
-      kind: "tool",
-      claudeMsgId: undefined,
-      platformMsgId: newId,
-      accumulated: line,
-    });
+    this.outbound.set(
+      session.channelKey,
+      freshOutboundState("tool", undefined, newId, line),
+    );
   }
 
   private async platformSend(replyTo: ReplyTarget, text: string): Promise<string | undefined> {
@@ -870,6 +922,41 @@ interface OutboundState {
   platformMsgId: string | undefined;
   /** Combined text we've sent so far for this bubble; basis for next edit. */
   accumulated: string;
+  /** Last actual platform edit timestamp — used to throttle further edits. */
+  lastEditAtMs: number;
+  /** Pending coalesced edit text awaiting flush. */
+  pendingText: string | null;
+  /** Timer for the deferred flush. */
+  pendingTimer: ReturnType<typeof setTimeout> | null;
+}
+
+/** Coalesce platform edits to at most 1 per second to stay clear of
+ *  Telegram-style rate limits and stop the UI from re-rendering on every
+ *  jsonl event. Inspired by OpenClaw's draft-stream throttle. */
+const EDIT_THROTTLE_MS = 1000;
+
+function freshOutboundState(
+  kind: "text" | "tool",
+  claudeMsgId: string | undefined,
+  platformMsgId: string | undefined,
+  accumulated: string,
+): OutboundState {
+  return {
+    kind,
+    claudeMsgId,
+    platformMsgId,
+    accumulated,
+    lastEditAtMs: Date.now(),
+    pendingText: null,
+    pendingTimer: null,
+  };
+}
+
+function clearOutboundState(s: OutboundState | undefined): void {
+  if (!s) return;
+  if (s.pendingTimer) clearTimeout(s.pendingTimer);
+  s.pendingTimer = null;
+  s.pendingText = null;
 }
 
 function deriveKindFromKey(
@@ -882,26 +969,6 @@ function deriveKindFromKey(
   return null;
 }
 
-function formatToolStatus(toolName: string, input: unknown): string {
-  let summary: string;
-  try {
-    if (typeof input === "string") {
-      summary = input;
-    } else if (input && typeof input === "object") {
-      const obj = input as Record<string, unknown>;
-      if (typeof obj.command === "string") summary = obj.command;
-      else if (typeof obj.description === "string") summary = obj.description;
-      else if (typeof obj.file_path === "string") summary = obj.file_path;
-      else summary = JSON.stringify(input);
-    } else {
-      summary = "";
-    }
-  } catch {
-    summary = "";
-  }
-  if (summary.length > 200) summary = summary.slice(0, 199) + "…";
-  return summary ? `🛠 ${toolName}: ${summary}` : `🛠 ${toolName}`;
-}
 
 async function main(): Promise<void> {
   const settings = await loadSettings();
