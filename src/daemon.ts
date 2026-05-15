@@ -17,6 +17,7 @@ import type { SourceInfo } from "./channel";
 import { StatuslineWriter } from "./statusline";
 import { backupV1GlobalIfExists, migrateFromV1 } from "./migrate";
 import { extractReactions } from "./reactions";
+import { isSilentReplyText, stripSilentToken } from "./silent";
 import { formatToolStatus } from "./tool-display";
 
 const PID_FILE = join(".claude", "claudeclaw", "daemon.pid");
@@ -682,31 +683,47 @@ class Daemon {
     }
     if (!cleanText && reactions.length === 0) return;
 
-    if (cleanText) {
+    // NO_REPLY: agent has decided this turn shouldn't surface anything on
+    // the platform (multi-party context, off-topic chatter, etc). Skip the
+    // text path entirely — reactions are still honoured.
+    let textToSend: string | null = cleanText;
+    if (cleanText && isSilentReplyText(cleanText)) {
+      console.log(`[daemon] [${session.channelKey}] NO_REPLY — suppressing text`);
+      textToSend = null;
+    } else if (cleanText) {
+      // The model sometimes appends a trailing NO_REPLY to a real reply.
+      // Strip the token but keep the rest.
+      const stripped = stripSilentToken(cleanText);
+      if (stripped !== cleanText) {
+        textToSend = stripped || null;
+      }
+    }
+
+    if (textToSend) {
       const state = this.outbound.get(session.channelKey);
       const sameBubble = state?.kind === "text" &&
         !!claudeMsgId && state.claudeMsgId === claudeMsgId &&
         !!state.platformMsgId;
       if (sameBubble && state) {
-        const combined = `${state.accumulated}\n\n${cleanText}`;
+        const combined = `${state.accumulated}\n\n${textToSend}`;
         state.accumulated = combined;
         const ok = await this.editWithThrottle(state, replyTo, combined);
         if (!ok) {
           // Edit failed (text too long, platform refused, etc) — fall back
           // to a fresh bubble for this segment.
           clearOutboundState(state);
-          const newId = await this.platformSend(replyTo, cleanText);
+          const newId = await this.platformSend(replyTo, textToSend);
           this.outbound.set(
             session.channelKey,
-            freshOutboundState("text", claudeMsgId, newId, cleanText),
+            freshOutboundState("text", claudeMsgId, newId, textToSend),
           );
         }
       } else {
         clearOutboundState(state);
-        const newId = await this.platformSend(replyTo, cleanText);
+        const newId = await this.platformSend(replyTo, textToSend);
         this.outbound.set(
           session.channelKey,
-          freshOutboundState("text", claudeMsgId, newId, cleanText),
+          freshOutboundState("text", claudeMsgId, newId, textToSend),
         );
       }
     }
