@@ -108,22 +108,39 @@ function jsonlPathFor(sessionId: string, projectDir: string): string {
 }
 
 /**
- * Detect "internal" slash-command output that Claude Code wrote into a
- * user-role jsonl entry. Returns the text to forward, or null to skip.
+ * Classify an internal user-role jsonl entry that Claude Code wrote on
+ * the user's behalf (slash command output, model-switch echo, etc).
  *
- *   `## Context Usage ...`                    → /context report (forward as-is)
- *   `<local-command-stdout>x</local-command-stdout>`  → wrapped stdout (forward inner)
- *   anything else (our own pastes, <command-name>, <local-command-caveat>) → skip
+ *   `## Context Usage …`                                → context-report (forward)
+ *   `<local-command-stdout>Set model to …</…>`           → model-switch (swallow or end-turn)
+ *   `<local-command-stdout>…</…>` (anything else)        → command-stdout (forward inner)
+ *   anything else (our own paste, <command-name>, etc.)  → none
  */
-function extractInternalSlashOutput(text: string): string | null {
+type InternalClassification =
+  | { kind: "context-report"; forward: string }
+  | { kind: "command-stdout"; forward: string | null }
+  | { kind: "model-switch" }
+  | { kind: "none" };
+
+function classifyInternalOutput(text: string): InternalClassification {
   const t = text.trimStart();
-  if (t.startsWith("## Context Usage")) return t;
+  if (t.startsWith("## Context Usage")) {
+    return { kind: "context-report", forward: t };
+  }
   const wrapped = t.match(/^<local-command-stdout>([\s\S]*?)<\/local-command-stdout>\s*$/);
   if (wrapped) {
-    const inner = wrapped[1].trim();
-    return inner || null;
+    const inner = stripAnsi(wrapped[1]).trim();
+    if (/^set model to\b/i.test(inner)) {
+      return { kind: "model-switch" };
+    }
+    return { kind: "command-stdout", forward: inner || null };
   }
-  return null;
+  return { kind: "none" };
+}
+
+/** Strip ANSI SGR escape sequences (color/bold/etc) from a string. */
+function stripAnsi(s: string): string {
+  return s.replace(/\[[0-9;]*[A-Za-z]/g, "");
 }
 
 function renderSourceLine(item: QueueItem): string {
@@ -194,6 +211,10 @@ export class Channel {
   /** The model the running `claude` process believes it's using. Updated on
    *  spawn and after each /model switch. */
   private currentModel: string = "";
+  /** True while we're waiting for the jsonl echo from a daemon-initiated
+   *  `/model` switch. The corresponding `Set model to …` entry should NOT
+   *  end the current turn — the user's actual prompt is what we're waiting on. */
+  private expectingModelEcho: boolean = false;
 
   constructor(private readonly opts: ChannelOptions) {
     this.currentModel = opts.defaultModel ?? "";
@@ -284,17 +305,25 @@ export class Channel {
           }
           break;
         case "user-message": {
-          // Most user-message entries are our own pastes (echoed back by Claude
-          // Code into the session) and we don't want to forward those. But some
-          // slash commands — notably /context and /compact — write their UI
-          // output into a user-role entry too, with distinctive markers. Detect
-          // those and forward, so platform users see the result of the command
-          // they typed. Also synthesize a turn-end: slash commands don't
-          // generate an assistant `end_turn`, so otherwise the channel would
-          // stay pinned in "running" and queue every subsequent message.
-          const forward = ev.userText ? extractInternalSlashOutput(ev.userText) : null;
-          if (forward) {
-            await this.opts.callbacks.onAssistantText(forward, this.currentTurnReplyTo);
+          if (!ev.userText) break;
+          const cls = classifyInternalOutput(ev.userText);
+          if (cls.kind === "model-switch") {
+            // /model switch echo: swallow when daemon initiated it (mid-turn,
+            // the agent's response is still coming); treat as a turn boundary
+            // when the user typed /model themselves and nothing else follows.
+            if (this.expectingModelEcho) {
+              this.expectingModelEcho = false;
+            } else {
+              this.onTurnEnd();
+            }
+            break;
+          }
+          if (cls.kind === "context-report" || cls.kind === "command-stdout") {
+            // User-initiated slash command output. Forward to platform and
+            // synthesize a turn-end — these don't emit assistant end_turn.
+            if (cls.forward) {
+              await this.opts.callbacks.onAssistantText(cls.forward, this.currentTurnReplyTo);
+            }
             this.onTurnEnd();
           }
           break;
@@ -453,13 +482,16 @@ export class Channel {
         `(was ${this.currentModel || "(default)"}, ${routed.reasoning})`,
     );
     try {
+      // Mark the next "Set model to …" jsonl echo as ours so it doesn't
+      // get treated as a turn boundary or forwarded to the platform.
+      this.expectingModelEcho = true;
       await sendKeys(target, `/model ${routed.model}`);
       await new Promise((r) => setTimeout(r, 80));
       await pressEnter(target);
-      // Claude Code's /model is client-side, near-instant.
       await new Promise((r) => setTimeout(r, 300));
       this.currentModel = routed.model;
     } catch (err) {
+      this.expectingModelEcho = false;
       console.error(`[channel ${this.opts.session.channelKey}] /model send failed:`, err);
     }
   }
