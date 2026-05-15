@@ -332,6 +332,20 @@ export class Channel {
 
   private async onJsonlEvent(ev: JsonlEvent): Promise<void> {
     try {
+      // Auto-wake detection: if we receive a fresh assistant event while
+      // the channel is idle, the agent has triggered itself (ScheduleWakeup,
+      // /loop self-pace, etc) without an inbound paste. Bump state so a
+      // concurrent user message doesn't race ahead with its own paste.
+      if (
+        this.state === "idle" &&
+        (ev.type === "assistant-text" ||
+          ev.type === "assistant-tool-use" ||
+          ev.type === "assistant-thinking")
+      ) {
+        this.state = "running";
+        this.startTypingPulse();
+      }
+
       switch (ev.type) {
         case "assistant-text":
           if (ev.text && ev.text.trim()) {
