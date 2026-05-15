@@ -132,14 +132,31 @@ export class TelegramPlatform implements TelegramSender {
     if (!token || !text) return;
     const chunks = chunkText(text);
     for (const chunk of chunks) {
+      const html = markdownToTelegramHtml(chunk);
       const res = await fetch(`${API_BASE}/bot${token}/sendMessage`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, text: chunk, disable_web_page_preview: true }),
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: html,
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+        }),
       });
       if (!res.ok) {
         const body = await res.text().catch(() => "");
         console.error(`[telegram] sendMessage failed (${res.status}): ${body.slice(0, 200)}`);
+        // Fallback: retry as plain text in case the HTML payload broke
+        // (unbalanced tags from weird markdown, etc).
+        const plainRes = await fetch(`${API_BASE}/bot${token}/sendMessage`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ chat_id: chatId, text: chunk, disable_web_page_preview: true }),
+        });
+        if (!plainRes.ok) {
+          const b = await plainRes.text().catch(() => "");
+          console.error(`[telegram] plain fallback also failed (${plainRes.status}): ${b.slice(0, 200)}`);
+        }
         return;
       }
     }
@@ -301,6 +318,47 @@ export class TelegramPlatform implements TelegramSender {
       ...extra,
     });
   }
+}
+
+/**
+ * Convert a markdown subset to Telegram-flavoured HTML so the bot can use
+ * `parse_mode: "HTML"`. Telegram's HTML mode supports `<b>`, `<i>`, `<u>`,
+ * `<s>`, `<code>`, `<pre>`, `<a href>`, `<tg-spoiler>`, and `<blockquote>`.
+ *
+ * What we translate:
+ *   - ```` ```lang\nblock``` ```` → `<pre>block</pre>`
+ *   - `` `inline` `` → `<code>inline</code>`
+ *   - `## heading` (any depth) → `<b>heading</b>`
+ *   - `**bold**` → `<b>bold</b>`
+ *   - everything else → HTML-escaped plaintext
+ *
+ * Tables, lists, links and italics are intentionally left as escaped
+ * literal text — they survive readably and never break the HTML parser.
+ */
+export function markdownToTelegramHtml(md: string): string {
+  const blocks: string[] = [];
+  let s = md.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, _lang, code) => {
+    const idx = blocks.length;
+    const trimmed = code.replace(/\n$/, "");
+    blocks.push(`<pre>${escapeHtml(trimmed)}</pre>`);
+    return `\x00BLOCK${idx}\x00`;
+  });
+  const inlines: string[] = [];
+  s = s.replace(/`([^`\n]+)`/g, (_, code) => {
+    const idx = inlines.length;
+    inlines.push(`<code>${escapeHtml(code)}</code>`);
+    return `\x00INLINE${idx}\x00`;
+  });
+  s = escapeHtml(s);
+  s = s.replace(/^(#{1,6})\s+(.+)$/gm, (_, _h, txt) => `<b>${txt}</b>`);
+  s = s.replace(/\*\*([^\n]+?)\*\*/g, "<b>$1</b>");
+  s = s.replace(/\x00INLINE(\d+)\x00/g, (_, n) => inlines[Number(n)] ?? "");
+  s = s.replace(/\x00BLOCK(\d+)\x00/g, (_, n) => blocks[Number(n)] ?? "");
+  return s;
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 const TG_MSG_LIMIT = 4000; // a bit under the 4096 hard limit, leaves room for splits
