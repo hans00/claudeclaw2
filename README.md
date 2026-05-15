@@ -51,6 +51,32 @@ Design background and spike findings live in [`docs/redesign.md`](docs/redesign.
 Prerequisites: [`bun`](https://bun.sh), [`tmux`](https://github.com/tmux/tmux),
 and the [Claude Code CLI](https://docs.claude.com/claude-code) on your PATH.
 
+### Option A — Claude Code plugin (recommended)
+
+Install the repo as a Claude Code plugin, then use the agent-guided
+setup wizard:
+
+```bash
+git clone https://github.com/hans00/claudeclaw2.git \
+  ~/.claude/plugins/marketplaces/claudeclaw2
+cd ~/.claude/plugins/marketplaces/claudeclaw2 && bun install
+```
+
+In any Claude Code session, `cd` into the project directory you want
+to use as ClaudeClaw's working dir, then:
+
+```
+/claudeclaw2:init      # interactive setup — picks platforms, edits
+                       # settings.json + CLAUDE.md + prompts/ for you
+/claudeclaw2:start     # boots the daemon
+/claudeclaw2:status    # health check
+```
+
+All available commands: `/claudeclaw2:init`, `start`, `stop`, `status`,
+`sessions`, `send`, `trigger`, `logs`, `migrate`, `help`.
+
+### Option B — Manual
+
 ```bash
 # 1. Clone + install
 git clone https://github.com/hans00/claudeclaw2.git ~/Projects/claudeclaw2

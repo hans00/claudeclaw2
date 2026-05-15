@@ -1,0 +1,5 @@
+{
+  "name": "claudeclaw2",
+  "version": "2.0.0",
+  "description": "Multi-channel bridge for Claude Code: per-channel tmux-hosted agents driven by Telegram / Discord / Slack / LINE"
+}

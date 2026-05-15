@@ -1,0 +1,16 @@
+{
+  "name": "claudeclaw2",
+  "owner": {
+    "name": "hans00"
+  },
+  "plugins": [
+    {
+      "name": "claudeclaw2",
+      "source": "./",
+      "description": "Multi-channel bridge for Claude Code: per-channel tmux-hosted agents driven by Telegram / Discord / Slack / LINE",
+      "version": "2.0.0",
+      "keywords": ["telegram", "discord", "slack", "line", "daemon", "scheduler", "multi-channel", "tmux"],
+      "category": "productivity"
+    }
+  ]
+}
