@@ -13,6 +13,7 @@
 import { readFile } from "fs/promises";
 import { join } from "path";
 import { loadSettings } from "./config";
+import { printInitReport, runInit } from "./init";
 
 const PID_FILE = join(".claude", "claudeclaw", "daemon.pid");
 
@@ -23,6 +24,7 @@ async function main(): Promise<void> {
     return;
   }
   switch (cmd) {
+    case "init":    await runInitCmd(rest); return;
     case "status":  await runStatus(); return;
     case "send":    await runSend(rest); return;
     case "trigger": await runTrigger(rest); return;
@@ -34,15 +36,30 @@ async function main(): Promise<void> {
   }
 }
 
+async function runInitCmd(args: string[]): Promise<void> {
+  const target = args[0] ?? process.cwd();
+  try {
+    const report = await runInit(target);
+    printInitReport(report);
+  } catch (err) {
+    console.error("[cli] init failed:", (err as Error).message);
+    process.exit(1);
+  }
+}
+
 function printHelp(): void {
   console.log(`claudeclaw CLI
 
+  init [target-dir]           Scaffold settings.json / prompts / CLAUDE.md /
+                              start.sh in a project directory (idempotent —
+                              never overwrites existing files)
   status                      Show daemon status (requires web API enabled)
   send <target> <text...>     Deliver text into target channel's inbox
   trigger <target> <prompt..> Run the agent on target channel with prompt
   stop                        Send SIGTERM to the running daemon (via pid file)
 
-  Targets:  global  |  telegram:<chatId>  |  discord:<channelId>  |  slack:<channelId>[:<threadTs>]
+  Targets:  global  |  telegram:<chatId>  |  discord:<channelId>  |
+            slack:<channelId>[:<threadTs>]  |  line:<sourceId>
 `);
 }
 
