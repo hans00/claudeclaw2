@@ -779,9 +779,14 @@ class Daemon {
     if (textToSend && stopReason !== "end_turn") {
       if (this.streamMode(replyTo) !== "off") {
         await this.updateProgress(session.channelKey, replyTo, (p) => {
-          p.intermediateText = p.intermediateText
-            ? `${p.intermediateText}\n\n${textToSend}`
-            : textToSend!;
+          const last = p.items[p.items.length - 1];
+          if (last?.kind === "text") {
+            // Coalesce consecutive intermediate-text events into one item
+            // so successive segments read as a single paragraph.
+            last.content = `${last.content}\n\n${textToSend}`;
+          } else {
+            p.items.push({ kind: "text", content: textToSend! });
+          }
         });
       }
       await this.applyReactions(replyTo, reactions);
@@ -994,7 +999,7 @@ class Daemon {
     const cleaned = text.trim();
     if (!cleaned) return;
     await this.updateProgress(session.channelKey, replyTo, (p) => {
-      p.reasoning = cleaned;
+      p.items.push({ kind: "reasoning", content: cleaned });
     });
   }
 
@@ -1012,7 +1017,7 @@ class Daemon {
       return;
     }
     await this.updateProgress(session.channelKey, replyTo, (p) => {
-      p.toolLines.push(line);
+      p.items.push({ kind: "tool", content: line });
       p.lastResult = "";
     });
   }
@@ -1169,18 +1174,25 @@ class Daemon {
 
 /**
  * What the agent is doing right now, distilled into one editable platform
- * message. Reasoning / tool calls / intermediate text / latest tool result
- * all go into a single "progress" bubble so the chat doesn't fill up with
- * a chain of bubbles before the real answer lands.
+ * message. Reasoning / tool calls / intermediate text are recorded in jsonl
+ * fire order so the bubble reads chronologically (a turn that does
+ * tool → text → tool stays readable as such).
+ *
+ * Consecutive tool calls coalesce on render into one block; if the run is
+ * longer than TOOL_LINES_MAX, older calls fold into a "… N earlier tool
+ * calls hidden" line. Only the latest tool's result is shown.
  */
+type ProgressItemKind = "reasoning" | "text" | "tool";
+
+interface ProgressItem {
+  kind: ProgressItemKind;
+  content: string;
+}
+
 interface ProgressContent {
-  /** Latest reasoning text (replaced each time, not accumulated). */
-  reasoning: string;
-  /** Pre-final assistant text segments (those with stop_reason !== end_turn). */
-  intermediateText: string;
-  /** Each tool call's status line in fire order. */
-  toolLines: string[];
-  /** Result preview for the LAST tool call only. Cleared when a new tool fires. */
+  /** Events in the order they fired during the turn. */
+  items: ProgressItem[];
+  /** Result preview for the LAST tool call only; cleared on each new tool. */
   lastResult: string;
 }
 
@@ -1209,7 +1221,7 @@ interface OutboundState {
 const EDIT_THROTTLE_MS = 1000;
 
 function emptyProgress(): ProgressContent {
-  return { reasoning: "", intermediateText: "", toolLines: [], lastResult: "" };
+  return { items: [], lastResult: "" };
 }
 
 function freshTextState(
@@ -1247,20 +1259,46 @@ function freshProgressState(
 }
 
 function renderProgress(p: ProgressContent): string {
-  const parts: string[] = [];
-  if (p.reasoning.trim()) {
-    parts.push(`💭 _Reasoning_\n${truncate(p.reasoning, REASONING_MAX_CHARS)}`);
+  if (p.items.length === 0) return "";
+  const blocks: string[] = [];
+  let i = 0;
+  while (i < p.items.length) {
+    const item = p.items[i];
+    if (item.kind === "tool") {
+      // Coalesce consecutive tool items into one block, truncating older
+      // calls if the run exceeds TOOL_LINES_MAX.
+      const tools: string[] = [];
+      while (i < p.items.length && p.items[i].kind === "tool") {
+        tools.push(p.items[i].content);
+        i++;
+      }
+      const hidden = Math.max(0, tools.length - TOOL_LINES_MAX);
+      const visible = hidden > 0 ? tools.slice(-TOOL_LINES_MAX) : tools;
+      const lines: string[] = [];
+      if (hidden > 0) {
+        lines.push(`… ${hidden} earlier tool call${hidden > 1 ? "s" : ""} hidden`);
+      }
+      lines.push(...visible);
+      // lastResult attaches only to the FINAL tool block (any subsequent
+      // tool item would have cleared it on dispatch anyway).
+      const hasMoreToolsAhead = p.items.slice(i).some((x) => x.kind === "tool");
+      if (!hasMoreToolsAhead && p.lastResult.trim()) {
+        lines.push(`  ↳ ${p.lastResult.trim()}`);
+      }
+      blocks.push(lines.join("\n"));
+      continue;
+    }
+    if (item.kind === "reasoning") {
+      blocks.push(`💭 _Reasoning_\n${truncate(item.content, REASONING_MAX_CHARS)}`);
+    } else {
+      blocks.push(item.content);
+    }
+    i++;
   }
-  if (p.intermediateText.trim()) {
-    parts.push(p.intermediateText.trim());
-  }
-  if (p.toolLines.length > 0) {
-    const lines = [...p.toolLines];
-    if (p.lastResult.trim()) lines.push(`  ↳ ${p.lastResult.trim()}`);
-    parts.push(lines.join("\n"));
-  }
-  return parts.join("\n\n");
+  return blocks.join("\n\n");
 }
+
+const TOOL_LINES_MAX = 5;
 
 function truncate(s: string, max: number): string {
   return s.length <= max ? s : s.slice(0, max - 1) + "…";
