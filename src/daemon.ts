@@ -13,6 +13,7 @@ import { Channel, type ChannelCallbacks, type ReplyTarget } from "./channel";
 import { loadSettings, type Settings } from "./config";
 import { CronScheduler, type Job } from "./jobs";
 import { HeartbeatScheduler, parseTimezoneOffset } from "./heartbeat";
+import type { SourceInfo } from "./channel";
 import { StatuslineWriter } from "./statusline";
 import { backupV1GlobalIfExists, migrateFromV1 } from "./migrate";
 import { extractReactions } from "./reactions";
@@ -253,11 +254,17 @@ class Daemon {
     await touchActivity(key);
     if (await this.tryHandleCommand(msg.text, channel, replyTo)) return;
     const text = composePromptWithAttachments(msg.text, msg.attachments);
+    const source: SourceInfo = {
+      platform: "line",
+      name: msg.fromName,
+      id: msg.fromUserId,
+    };
     await channel.handleIncoming({
       text,
       fromLabel: msg.fromName,
       platformMsgId: msg.messageId,
       replyTo,
+      source,
     });
   }
 
@@ -320,11 +327,18 @@ class Daemon {
     await touchActivity(key);
     if (await this.tryHandleCommand(msg.text, channel, replyTo)) return;
     const text = composePromptWithAttachments(msg.text, msg.attachments);
+    const source: SourceInfo = {
+      platform: "discord",
+      name: msg.fromName,
+      username: msg.fromUsername,
+      id: msg.fromUserId,
+    };
     await channel.handleIncoming({
       text,
       fromLabel: msg.fromName,
       platformMsgId: msg.messageId,
       replyTo,
+      source,
     });
   }
 
@@ -342,11 +356,18 @@ class Daemon {
     await touchActivity(key);
     if (await this.tryHandleCommand(msg.text, channel, replyTo)) return;
     const text = composePromptWithAttachments(msg.text, msg.attachments);
+    const source: SourceInfo = {
+      platform: "telegram",
+      name: msg.fromName,
+      username: msg.fromUsername,
+      id: String(msg.fromUserId),
+    };
     await channel.handleIncoming({
       text,
       fromLabel: msg.fromName,
       platformMsgId: String(msg.messageId),
       replyTo,
+      source,
     });
   }
 
@@ -516,6 +537,7 @@ class Daemon {
       callbacks,
       defaultModel: this.settings.model,
       agentic: this.settings.agentic,
+      timezoneOffsetMinutes: parseTimezoneOffset(this.settings.timezone),
     });
   }
 

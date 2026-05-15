@@ -44,6 +44,8 @@ export interface DiscordInbound {
   messageId: string;
   fromUserId: string;
   fromName: string;
+  /** Discord username (the unique handle, distinct from display name). */
+  fromUsername?: string;
   isBot: boolean;
   mentionsBot: boolean;
   text: string;
@@ -253,6 +255,7 @@ export class DiscordPlatform implements DiscordSender {
     }
 
     const fromName = String(m.author.global_name ?? m.author.username ?? userId);
+    const fromUsername = typeof m.author.username === "string" ? m.author.username : undefined;
     const attachments = await this.collectAttachments(m, channelId);
     await this.opts.router.handleMessage({
       guildId,
@@ -260,6 +263,7 @@ export class DiscordPlatform implements DiscordSender {
       messageId: m.id,
       fromUserId: userId,
       fromName,
+      fromUsername,
       isBot,
       mentionsBot,
       text,

@@ -56,14 +56,26 @@ export interface ChannelCallbacks {
   onError?(err: Error): void;
 }
 
+export interface SourceInfo {
+  platform: "telegram" | "discord" | "slack" | "line";
+  /** Display name (first+last, global_name, etc). */
+  name: string;
+  /** Platform-native username when available (@-handle without the @). */
+  username?: string;
+  /** Platform-native id (numeric for telegram, snowflake for discord, U... for slack/line). */
+  id: string;
+}
+
 export interface QueueItem {
   text: string;
-  /** Display label for the sender, used in multi-party prompts. */
+  /** Display label used when there's no structured `source` (cron, heartbeat, api). */
   fromLabel?: string;
   /** Platform message id (so the connector can reply-to or edit). */
   platformMsgId?: string;
   /** Where to send outbound responses for this message. */
   replyTo: ReplyTarget;
+  /** Structured sender info for platform inbounds — used to render the prompt prefix. */
+  source?: SourceInfo;
 }
 
 export interface ChannelOptions {
@@ -81,6 +93,9 @@ export interface ChannelOptions {
    *  prompt and sends /model &lt;name&gt; via tmux if the routed model differs
    *  from the channel's currentModel. */
   agentic?: AgenticConfig;
+  /** Timezone offset in minutes (e.g. +480 for UTC+8). Used to render the
+   *  timestamp line on the prompt prefix. */
+  timezoneOffsetMinutes?: number;
 }
 
 function encodeProjectDir(projectDir: string): string {
@@ -90,6 +105,40 @@ function encodeProjectDir(projectDir: string): string {
 function jsonlPathFor(sessionId: string, projectDir: string): string {
   const encoded = encodeProjectDir(projectDir);
   return join(homedir(), ".claude", "projects", encoded, `${sessionId}.jsonl`);
+}
+
+function renderSourceLine(item: QueueItem): string {
+  if (item.source) {
+    const s = item.source;
+    const platform = s.platform.charAt(0).toUpperCase() + s.platform.slice(1);
+    const ident: string[] = [];
+    if (s.username) ident.push(`@${s.username}`);
+    ident.push(s.id);
+    return `[${platform} from ${s.name} (${ident.join(" · ")})]`;
+  }
+  if (item.fromLabel) return `[${item.fromLabel}]`;
+  return `[anonymous]`;
+}
+
+function formatUtcOffset(offsetMinutes: number): string {
+  if (offsetMinutes === 0) return "UTC";
+  const sign = offsetMinutes > 0 ? "+" : "-";
+  const abs = Math.abs(offsetMinutes);
+  const h = Math.floor(abs / 60);
+  const m = abs % 60;
+  return m === 0 ? `UTC${sign}${h}` : `UTC${sign}${h}:${String(m).padStart(2, "0")}`;
+}
+
+function formatTimestamp(d: Date, offsetMinutes: number): string {
+  const shifted = new Date(d.getTime() + offsetMinutes * 60_000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const y = shifted.getUTCFullYear();
+  const mo = pad(shifted.getUTCMonth() + 1);
+  const da = pad(shifted.getUTCDate());
+  const h = pad(shifted.getUTCHours());
+  const mi = pad(shifted.getUTCMinutes());
+  const s = pad(shifted.getUTCSeconds());
+  return `${y}-${mo}-${da} ${h}:${mi}:${s} ${formatUtcOffset(offsetMinutes)}`;
 }
 
 /**
@@ -318,8 +367,8 @@ export class Channel {
     }
 
     const inboxText = await this.buildInboxPrefix();
-    const head = item.fromLabel ? `[${item.fromLabel}] ` : "";
-    const full = [inboxText, head + item.text].filter(Boolean).join("\n\n");
+    const promptBody = this.formatPromptBody(item);
+    const full = [inboxText, promptBody].filter(Boolean).join("\n\n");
 
     try {
       await this.maybeSwitchModel(item.text);
@@ -331,6 +380,23 @@ export class Channel {
       this.opts.callbacks.onError?.(err as Error);
       this.state = "idle";
     }
+  }
+
+  /**
+   * Render the prompt body the agent sees. Format (v1 parity):
+   *
+   *   [2026-05-15 14:32:17 UTC+8]
+   *   [Telegram from Hans (@HansX · 116013788)]
+   *   Message: <user text>
+   *
+   * For non-platform sources (cron, heartbeat, api) the second line falls
+   * back to the fromLabel, with no @username/id triplet.
+   */
+  private formatPromptBody(item: QueueItem): string {
+    const tz = this.opts.timezoneOffsetMinutes ?? 0;
+    const stamp = formatTimestamp(new Date(), tz);
+    const sourceLine = renderSourceLine(item);
+    return `[${stamp}]\n${sourceLine}\nMessage: ${item.text}`;
   }
 
   /**

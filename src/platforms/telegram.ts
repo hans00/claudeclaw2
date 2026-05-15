@@ -77,6 +77,8 @@ export interface InboundMessage {
   chatType: "private" | "group" | "supergroup" | "channel";
   fromUserId: number;
   fromName: string;
+  /** @-handle without the leading @, when the user has one. */
+  fromUsername?: string;
   /** Text body (msg.text OR msg.caption if it was a media message). */
   text: string;
   messageId: number;
@@ -221,6 +223,7 @@ export class TelegramPlatform implements TelegramSender {
         chatType: msg.chat.type,
         fromUserId: msg.from.id,
         fromName: name,
+        fromUsername: msg.from.username,
         text,
         messageId: msg.message_id,
         attachments,
