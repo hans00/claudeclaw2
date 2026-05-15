@@ -87,6 +87,9 @@ export interface QueueItem {
   replyTo: ReplyTarget;
   /** Structured sender info for platform inbounds — used to render the prompt prefix. */
   source?: SourceInfo;
+  /** Paste text verbatim, skipping the `[ts][source]\nMessage:` wrapper.
+   *  Used for cron + heartbeat firings to match v1 behaviour. */
+  rawPrompt?: boolean;
 }
 
 export interface ChannelOptions {
@@ -465,14 +468,14 @@ export class Channel {
     }
 
     const inboxText = await this.buildInboxPrefix();
-    const promptBody = this.formatPromptBody(item);
+    const promptBody = item.rawPrompt ? item.text : this.formatPromptBody(item);
     const full = [inboxText, promptBody].filter(Boolean).join("\n\n");
 
     this.startTypingPulse();
     try {
       await this.maybeSwitchModel(item.text);
       await pasteText(target, full);
-      await new Promise((r) => setTimeout(r, 80));
+      await new Promise((r) => setTimeout(r, 250));
       await pressEnter(target);
     } catch (err) {
       console.error(`[channel ${this.opts.session.channelKey}] paste failed:`, err);
@@ -522,7 +525,7 @@ export class Channel {
       // get treated as a turn boundary or forwarded to the platform.
       this.expectingModelEcho = true;
       await sendKeys(target, `/model ${routed.model}`);
-      await new Promise((r) => setTimeout(r, 80));
+      await new Promise((r) => setTimeout(r, 250));
       await pressEnter(target);
       await new Promise((r) => setTimeout(r, 300));
       this.currentModel = routed.model;

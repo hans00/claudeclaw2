@@ -10,7 +10,46 @@
  *     ambient, never preempts real work
  *   - Tracks lastFiredAt in memory (intentionally resets on daemon restart)
  */
+import { readFile } from "fs/promises";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
 import type { HeartbeatConfig, HeartbeatWindow } from "./config";
+
+const BUILTIN_HEARTBEAT_PROMPT = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "prompts",
+  "heartbeat",
+  "HEARTBEAT.md",
+);
+
+const PROJECT_HEARTBEAT_PROMPT = join("prompts", "heartbeat", "HEARTBEAT.md");
+
+/**
+ * Resolve the heartbeat template — project override at
+ * `prompts/heartbeat/HEARTBEAT.md` (in cwd) takes precedence, falling back
+ * to the built-in shipped with the plugin source.
+ */
+export async function loadHeartbeatTemplate(): Promise<string> {
+  for (const file of [PROJECT_HEARTBEAT_PROMPT, BUILTIN_HEARTBEAT_PROMPT]) {
+    try {
+      const content = (await readFile(file, "utf8")).trim();
+      if (content) return content;
+    } catch {}
+  }
+  return "";
+}
+
+/** Merge the template with the user's settings.heartbeat.prompt — the
+ *  template carries the "send a casual nudge or HEARTBEAT_OK" instructions
+ *  and the user-supplied prompt is appended as additional context. */
+export function composeHeartbeatPrompt(template: string, userPrompt: string): string {
+  const tpl = template.trim();
+  const usr = userPrompt.trim();
+  if (!tpl) return usr;
+  if (!usr) return tpl;
+  return `${tpl}\n\nUser custom heartbeat prompt:\n${usr}`;
+}
 
 export interface HeartbeatHooks {
   /** Returns true when fire-attempt was actually dispatched (false = skipped). */

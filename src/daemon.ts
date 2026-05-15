@@ -11,7 +11,7 @@ import { dirname, join } from "path";
 import { Channel, type ChannelCallbacks, type ReplyTarget } from "./channel";
 import { loadSettings, type Settings } from "./config";
 import { CronScheduler, type Job } from "./jobs";
-import { HeartbeatScheduler, parseTimezoneOffset } from "./heartbeat";
+import { composeHeartbeatPrompt, HeartbeatScheduler, loadHeartbeatTemplate, parseTimezoneOffset } from "./heartbeat";
 import type { SourceInfo } from "./channel";
 import { StatuslineWriter } from "./statusline";
 import { backupV1GlobalIfExists, migrateFromV1 } from "./migrate";
@@ -125,13 +125,17 @@ class Daemon {
       config: this.settings.heartbeat,
       timezoneOffsetMinutes: parseTimezoneOffset(this.settings.timezone),
       hooks: {
-        fire: async (prompt) => {
+        fire: async (userPrompt) => {
           const channel = await this.ensureChannel(GLOBAL_KEY, "global", false);
           if (!channel) return false;
+          const template = await loadHeartbeatTemplate();
+          const merged = composeHeartbeatPrompt(template, userPrompt);
+          if (!merged) return false;
           await channel.handleIncoming({
-            text: prompt,
+            text: merged,
             fromLabel: "heartbeat",
             replyTo: null,
+            rawPrompt: true, // v1 parity: heartbeat template fires verbatim
           });
           return true;
         },
@@ -165,6 +169,7 @@ class Daemon {
       text: job.body,
       fromLabel: `cron:${job.name}`,
       replyTo: job.replyTo,
+      rawPrompt: true, // v1 parity: cron body fires verbatim, no prefix wrap
     });
   }
 
