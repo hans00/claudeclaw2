@@ -484,10 +484,7 @@ class Daemon {
         await this.dispatchAssistantText(session, text, replyTo, claudeMsgId);
       },
       onToolUse: async (toolName, input, replyTo) => {
-        // Tool messages always start a new bubble — edit-in-place doesn't
-        // span tool calls, otherwise the message order looks confusing.
-        this.outbound.delete(session.channelKey);
-        await this.dispatchOutbound(session, formatToolStatus(toolName, input), replyTo);
+        await this.dispatchToolUse(session, toolName, input, replyTo);
       },
       onTurnEnd: () => {
         this.outbound.delete(session.channelKey);
@@ -544,7 +541,9 @@ class Daemon {
 
     if (cleanText) {
       const state = this.outbound.get(session.channelKey);
-      const sameBubble = !!claudeMsgId && state?.claudeMsgId === claudeMsgId && !!state.platformMsgId;
+      const sameBubble = state?.kind === "text" &&
+        !!claudeMsgId && state.claudeMsgId === claudeMsgId &&
+        !!state.platformMsgId;
       if (sameBubble && state) {
         const combined = `${state.accumulated}\n\n${cleanText}`;
         const ok = await this.platformEdit(replyTo, state.platformMsgId!, combined);
@@ -555,6 +554,7 @@ class Daemon {
           // to a fresh bubble for this segment.
           const newId = await this.platformSend(replyTo, cleanText);
           this.outbound.set(session.channelKey, {
+            kind: "text",
             claudeMsgId,
             platformMsgId: newId,
             accumulated: cleanText,
@@ -563,6 +563,7 @@ class Daemon {
       } else {
         const newId = await this.platformSend(replyTo, cleanText);
         this.outbound.set(session.channelKey, {
+          kind: "text",
           claudeMsgId,
           platformMsgId: newId,
           accumulated: cleanText,
@@ -571,6 +572,42 @@ class Daemon {
     }
 
     await this.applyReactions(replyTo, reactions);
+  }
+
+  /**
+   * Consecutive tool-use events within a turn collapse into a single growing
+   * status bubble — "🛠 Bash: ls\n🛠 Read: foo.ts\n…" — instead of one
+   * platform message per tool call. Switching back to text (or a new turn)
+   * starts a fresh bubble.
+   */
+  private async dispatchToolUse(
+    session: ChannelSession,
+    toolName: string,
+    input: unknown,
+    replyTo: ReplyTarget,
+  ): Promise<void> {
+    const line = formatToolStatus(toolName, input);
+    if (!replyTo) {
+      console.log(`[daemon] [${session.channelKey}] no replyTo — tool: ${line}`);
+      return;
+    }
+    const state = this.outbound.get(session.channelKey);
+    if (state?.kind === "tool" && state.platformMsgId) {
+      const combined = `${state.accumulated}\n${line}`;
+      const ok = await this.platformEdit(replyTo, state.platformMsgId, combined);
+      if (ok) {
+        state.accumulated = combined;
+        return;
+      }
+      // Edit failed — start a fresh tool bubble for this line.
+    }
+    const newId = await this.platformSend(replyTo, line);
+    this.outbound.set(session.channelKey, {
+      kind: "tool",
+      claudeMsgId: undefined,
+      platformMsgId: newId,
+      accumulated: line,
+    });
   }
 
   private async platformSend(replyTo: ReplyTarget, text: string): Promise<string | undefined> {
@@ -701,7 +738,11 @@ class Daemon {
 }
 
 interface OutboundState {
-  /** Claude Code message.id whose segments we're accumulating. */
+  /** Whether the current bubble is collecting assistant text or tool-call
+   *  status lines — switching kinds starts a fresh bubble. */
+  kind: "text" | "tool";
+  /** Claude Code message.id whose segments we're accumulating. Only set
+   *  for text bubbles (tool bubbles accumulate across msg_ids within a turn). */
   claudeMsgId: string | undefined;
   /** Platform-side id of the message we'd edit (string for portability). */
   platformMsgId: string | undefined;
