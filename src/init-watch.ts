@@ -66,14 +66,15 @@ const KNOWN_PROMPTS: PromptPattern[] = [
 ];
 
 /**
- * Ready when we see Claude Code's permission indicator (`⏵⏵ ... permissions ...`)
- * in the pane. This appears on the status line below the input box only after
- * the TUI has finished initializing and is accepting input.
+ * Ready when we see Claude Code's permission-mode indicator (`⏵⏵ ...`)
+ * — that line only appears once the TUI has finished initializing and is
+ * accepting input. We additionally require the prompt cursor `❯` to appear
+ * somewhere in the pane. Both markers are very specific to Claude Code's
+ * status line so a substring check is enough.
  */
 function isReady(pane: string): boolean {
-  if (!/⏵⏵.*permissions/i.test(pane)) return false;
-  // Belt-and-braces: the input prompt cursor row should also be present.
-  if (!pane.includes("❯ ") && !pane.includes("❯\n")) return false;
+  if (!pane.includes("⏵⏵")) return false;
+  if (!pane.includes("❯")) return false;
   return true;
 }
 
@@ -98,6 +99,7 @@ export async function waitForReady(opts: WaitForReadyOptions): Promise<InitWatch
   let stableSince = Date.now();
   let escSent = false;
   let lastPane = "";
+  let lastReadyMarkerCheck = "";
 
   while (Date.now() - start < timeout) {
     let pane: string;
@@ -113,6 +115,17 @@ export async function waitForReady(opts: WaitForReadyOptions): Promise<InitWatch
     lastPane = pane;
 
     if (isReady(pane)) return { status: "ready", pane };
+
+    // Debug: every ~10s log which markers are/aren't present so we can
+    // diagnose stuck cases without re-reading the entire pane in the log.
+    const sinceStart = Date.now() - start;
+    if (sinceStart > 10_000 && sinceStart % 10_000 < interval) {
+      const dbg = `⏵⏵=${pane.includes("⏵⏵")} ❯=${pane.includes("❯")}`;
+      if (dbg !== lastReadyMarkerCheck) {
+        console.log(`[init-watch] ${opts.target} markers: ${dbg}`);
+        lastReadyMarkerCheck = dbg;
+      }
+    }
 
     const prompt = detectKnownPrompt(pane);
     if (prompt) {
