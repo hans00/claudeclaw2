@@ -49,8 +49,10 @@ export interface ChannelCallbacks {
   /** Post a finished assistant text segment to the platform. `claudeMsgId`
    *  is Claude Code's stable id for this assistant "bubble" — segments that
    *  share the same id should be edited-in-place when the platform supports
-   *  it; a different id means a new bubble (e.g. after a tool result). */
-  onAssistantText(text: string, replyTo: ReplyTarget, claudeMsgId?: string): Promise<void> | void;
+   *  it; a different id means a new bubble (e.g. after a tool result).
+   *  `stopReason` lets the receiver tell intermediate text (more tools coming)
+   *  apart from the actual final answer (`end_turn`). */
+  onAssistantText(text: string, replyTo: ReplyTarget, claudeMsgId?: string, stopReason?: string): Promise<void> | void;
   /** Post a tool-call status indicator (e.g. "🛠 Bash: echo hi"). */
   onToolUse(toolName: string, input: unknown, replyTo: ReplyTarget): Promise<void> | void;
   /** Append a tool execution result preview under the current tool bubble.
@@ -349,7 +351,12 @@ export class Channel {
       switch (ev.type) {
         case "assistant-text":
           if (ev.text && ev.text.trim()) {
-            await this.opts.callbacks.onAssistantText(ev.text, this.currentTurnReplyTo, ev.msgId);
+            await this.opts.callbacks.onAssistantText(
+              ev.text,
+              this.currentTurnReplyTo,
+              ev.msgId,
+              ev.stopReason,
+            );
           }
           break;
         case "assistant-tool-use":

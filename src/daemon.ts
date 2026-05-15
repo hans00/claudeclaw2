@@ -688,8 +688,8 @@ class Daemon {
 
   private makeChannel(session: ChannelSession): Channel {
     const callbacks: ChannelCallbacks = {
-      onAssistantText: async (text, replyTo, claudeMsgId) => {
-        await this.dispatchAssistantText(session, text, replyTo, claudeMsgId);
+      onAssistantText: async (text, replyTo, claudeMsgId, stopReason) => {
+        await this.dispatchAssistantText(session, text, replyTo, claudeMsgId, stopReason);
       },
       onToolUse: async (toolName, input, replyTo) => {
         await this.dispatchToolUse(session, toolName, input, replyTo);
@@ -737,12 +737,16 @@ class Daemon {
    * Edit-in-place when the assistant emits consecutive text segments with
    * the same Claude msg_id; otherwise send a new platform message and
    * remember the id for the next segment.
+   *
+   * Intermediate text (stop_reason !== "end_turn") gets folded into the
+   * progress bubble — only the final answer becomes its own bubble.
    */
   private async dispatchAssistantText(
     session: ChannelSession,
     text: string,
     replyTo: ReplyTarget,
     claudeMsgId: string | undefined,
+    stopReason: string | undefined,
   ): Promise<void> {
     const { cleanText, reactions } = extractReactions(text);
     if (!replyTo) {
@@ -769,6 +773,21 @@ class Daemon {
       }
     }
 
+    // Pre-final ("intermediate") text — more tools coming, this isn't the
+    // user-visible answer yet. Fold into the progress bubble so it doesn't
+    // create its own message.
+    if (textToSend && stopReason !== "end_turn") {
+      if (this.streamMode(replyTo) !== "off") {
+        await this.updateProgress(session.channelKey, replyTo, (p) => {
+          p.intermediateText = p.intermediateText
+            ? `${p.intermediateText}\n\n${textToSend}`
+            : textToSend!;
+        });
+      }
+      await this.applyReactions(replyTo, reactions);
+      return;
+    }
+
     if (textToSend) {
       const state = this.outbound.get(session.channelKey);
       const sameBubble = state?.kind === "text" &&
@@ -787,7 +806,7 @@ class Daemon {
           const newId = await this.platformSend(replyTo, textToSend);
           this.outbound.set(
             session.channelKey,
-            freshOutboundState("text", claudeMsgId, newId, textToSend),
+            freshTextState(claudeMsgId, newId, textToSend),
           );
         }
       } else {
@@ -797,7 +816,7 @@ class Daemon {
         const newId = await this.platformSend(replyTo, textToSend);
         this.outbound.set(
           session.channelKey,
-          freshOutboundState("text", claudeMsgId, newId, textToSend),
+          freshTextState(claudeMsgId, newId, textToSend),
         );
       }
     }
@@ -923,74 +942,63 @@ class Daemon {
   }
 
   /**
-   * Reasoning ("thinking") bubble. Shown before tool calls / final answer
-   * when the model emits visible deliberation. Same edit-in-place + throttle
-   * semantics as text/tool bubbles.
-   *
-   * Suppressed entirely when settings.messageStream.mode === "off".
+   * Update the progress bubble (creating one if needed) by running a
+   * mutator over its structured content, then re-rendering and editing.
+   * Returns the (possibly new) state, or null if streamMode is off / no
+   * content yet / no replyTo.
    */
+  private async updateProgress(
+    channelKey: string,
+    replyTo: ReplyTarget,
+    mutate: (p: ProgressContent) => void,
+  ): Promise<OutboundState | null> {
+    if (!replyTo) return null;
+    let state = this.outbound.get(channelKey);
+    if (state?.kind === "progress") {
+      mutate(state.progress);
+      const rendered = renderProgress(state.progress);
+      if (!rendered || rendered === state.accumulated) return state;
+      state.accumulated = rendered;
+      await this.editWithThrottle(state, replyTo, rendered);
+      return state;
+    }
+    // Need to start a new progress bubble (possibly archiving a text bubble).
+    if (state) {
+      this.archiveAsPreview(channelKey, state, replyTo);
+      clearOutboundState(state);
+    }
+    const progress = emptyProgress();
+    mutate(progress);
+    const rendered = renderProgress(progress);
+    if (!rendered) return null;
+    const newId = await this.platformSend(replyTo, rendered);
+    if (!newId) return null;
+    state = freshProgressState(newId, rendered, progress);
+    this.outbound.set(channelKey, state);
+    return state;
+  }
+
+  /** Reasoning gets folded into the current progress bubble. Latest only. */
   private async dispatchReasoning(
     session: ChannelSession,
     text: string,
-    replyTo: ReplyTarget,
-    claudeMsgId: string | undefined,
+    _replyTo: ReplyTarget,
+    _claudeMsgId: string | undefined,
   ): Promise<void> {
+    const replyTo = _replyTo;
     if (this.streamMode(replyTo) === "off") return;
     if (!replyTo) {
       console.log(`[daemon] [${session.channelKey}] no replyTo — reasoning: ${text.slice(0, 200)}`);
       return;
     }
-    const line = formatReasoningLine(text);
-    if (!line) return;
-    const state = this.outbound.get(session.channelKey);
-    const sameBubble = state?.kind === "reasoning" &&
-      !!claudeMsgId && state.claudeMsgId === claudeMsgId &&
-      !!state.platformMsgId;
-    if (sameBubble && state) {
-      state.accumulated = line;
-      const ok = await this.editWithThrottle(state, replyTo, line);
-      if (ok) return;
-      this.archiveAsPreview(session.channelKey, state, replyTo);
-      clearOutboundState(state);
-    } else if (state) {
-      this.archiveAsPreview(session.channelKey, state, replyTo);
-      clearOutboundState(state);
-    }
-    const newId = await this.platformSend(replyTo, line);
-    this.outbound.set(
-      session.channelKey,
-      freshOutboundState("reasoning", claudeMsgId, newId, line),
-    );
+    const cleaned = text.trim();
+    if (!cleaned) return;
+    await this.updateProgress(session.channelKey, replyTo, (p) => {
+      p.reasoning = cleaned;
+    });
   }
 
-  /**
-   * Append a truncated tool-result preview under the current tool bubble,
-   * indented to make the call → result relationship visible. No-op when
-   * there's no active tool bubble.
-   */
-  private async dispatchToolResult(
-    session: ChannelSession,
-    _toolUseId: string | undefined,
-    result: string,
-    replyTo: ReplyTarget,
-  ): Promise<void> {
-    if (this.streamMode(replyTo) === "off") return;
-    if (!replyTo) return;
-    const state = this.outbound.get(session.channelKey);
-    if (!state || state.kind !== "tool" || !state.platformMsgId) return;
-    const preview = formatToolResultPreview(result);
-    if (!preview) return;
-    const combined = `${state.accumulated}\n  ↳ ${preview}`;
-    state.accumulated = combined;
-    await this.editWithThrottle(state, replyTo, combined);
-  }
-
-  /**
-   * Consecutive tool-use events within a turn collapse into a single growing
-   * status bubble — "🛠 Bash: ls\n🛠 Read: foo.ts\n…" — instead of one
-   * platform message per tool call. Switching back to text (or a new turn)
-   * starts a fresh bubble.
-   */
+  /** Tool-use appends a status line and clears the "lastResult" slot. */
   private async dispatchToolUse(
     session: ChannelSession,
     toolName: string,
@@ -1003,25 +1011,30 @@ class Daemon {
       console.log(`[daemon] [${session.channelKey}] no replyTo — tool: ${line}`);
       return;
     }
+    await this.updateProgress(session.channelKey, replyTo, (p) => {
+      p.toolLines.push(line);
+      p.lastResult = "";
+    });
+  }
+
+  /** Tool result sets the "lastResult" slot — only the latest tool's
+   *  result is shown to keep the bubble compact. No-op when there's no
+   *  active progress bubble. */
+  private async dispatchToolResult(
+    session: ChannelSession,
+    _toolUseId: string | undefined,
+    result: string,
+    replyTo: ReplyTarget,
+  ): Promise<void> {
+    if (this.streamMode(replyTo) === "off") return;
+    if (!replyTo) return;
     const state = this.outbound.get(session.channelKey);
-    if (state?.kind === "tool" && state.platformMsgId) {
-      const combined = `${state.accumulated}\n${line}`;
-      state.accumulated = combined;
-      const ok = await this.editWithThrottle(state, replyTo, combined);
-      if (ok) return;
-      // Edit failed — start a fresh tool bubble for this line.
-      this.archiveAsPreview(session.channelKey, state, replyTo);
-      clearOutboundState(state);
-    } else if (state && state.kind !== "tool") {
-      // Switching from another kind into a tool bubble.
-      this.archiveAsPreview(session.channelKey, state, replyTo);
-      clearOutboundState(state);
-    }
-    const newId = await this.platformSend(replyTo, line);
-    this.outbound.set(
-      session.channelKey,
-      freshOutboundState("tool", undefined, newId, line),
-    );
+    if (!state || state.kind !== "progress") return;
+    const preview = formatToolResultPreview(result);
+    if (!preview) return;
+    await this.updateProgress(session.channelKey, replyTo, (p) => {
+      p.lastResult = preview;
+    });
   }
 
   private async platformSend(replyTo: ReplyTarget, text: string): Promise<string | undefined> {
@@ -1154,17 +1167,34 @@ class Daemon {
   }
 }
 
+/**
+ * What the agent is doing right now, distilled into one editable platform
+ * message. Reasoning / tool calls / intermediate text / latest tool result
+ * all go into a single "progress" bubble so the chat doesn't fill up with
+ * a chain of bubbles before the real answer lands.
+ */
+interface ProgressContent {
+  /** Latest reasoning text (replaced each time, not accumulated). */
+  reasoning: string;
+  /** Pre-final assistant text segments (those with stop_reason !== end_turn). */
+  intermediateText: string;
+  /** Each tool call's status line in fire order. */
+  toolLines: string[];
+  /** Result preview for the LAST tool call only. Cleared when a new tool fires. */
+  lastResult: string;
+}
+
 interface OutboundState {
-  /** Whether the current bubble is collecting assistant text, tool-call
-   *  status lines, or reasoning — switching kinds starts a fresh bubble. */
-  kind: "text" | "tool" | "reasoning";
-  /** Claude Code message.id whose segments we're accumulating. Only set
-   *  for text bubbles (tool bubbles accumulate across msg_ids within a turn). */
-  claudeMsgId: string | undefined;
-  /** Platform-side id of the message we'd edit (string for portability). */
+  /** progress = the unified pre-final bubble. text = the final answer bubble. */
+  kind: "progress" | "text";
+  /** Platform-side id of the message we'd edit. */
   platformMsgId: string | undefined;
-  /** Combined text we've sent so far for this bubble; basis for next edit. */
+  /** Currently-rendered text on the platform (basis for next edit/diff). */
   accumulated: string;
+  /** Structured contents (progress bubbles only). */
+  progress: ProgressContent;
+  /** Claude Code message.id (text bubbles only — groups text segments). */
+  claudeMsgId: string | undefined;
   /** Last actual platform edit timestamp — used to throttle further edits. */
   lastEditAtMs: number;
   /** Pending coalesced edit text awaiting flush. */
@@ -1178,21 +1208,62 @@ interface OutboundState {
  *  jsonl event. Inspired by OpenClaw's draft-stream throttle. */
 const EDIT_THROTTLE_MS = 1000;
 
-function freshOutboundState(
-  kind: "text" | "tool" | "reasoning",
+function emptyProgress(): ProgressContent {
+  return { reasoning: "", intermediateText: "", toolLines: [], lastResult: "" };
+}
+
+function freshTextState(
   claudeMsgId: string | undefined,
   platformMsgId: string | undefined,
   accumulated: string,
 ): OutboundState {
   return {
-    kind,
+    kind: "text",
     claudeMsgId,
     platformMsgId,
     accumulated,
+    progress: emptyProgress(),
     lastEditAtMs: Date.now(),
     pendingText: null,
     pendingTimer: null,
   };
+}
+
+function freshProgressState(
+  platformMsgId: string,
+  accumulated: string,
+  progress: ProgressContent,
+): OutboundState {
+  return {
+    kind: "progress",
+    claudeMsgId: undefined,
+    platformMsgId,
+    accumulated,
+    progress,
+    lastEditAtMs: Date.now(),
+    pendingText: null,
+    pendingTimer: null,
+  };
+}
+
+function renderProgress(p: ProgressContent): string {
+  const parts: string[] = [];
+  if (p.reasoning.trim()) {
+    parts.push(`💭 _Reasoning_\n${truncate(p.reasoning, REASONING_MAX_CHARS)}`);
+  }
+  if (p.intermediateText.trim()) {
+    parts.push(p.intermediateText.trim());
+  }
+  if (p.toolLines.length > 0) {
+    const lines = [...p.toolLines];
+    if (p.lastResult.trim()) lines.push(`  ↳ ${p.lastResult.trim()}`);
+    parts.push(lines.join("\n"));
+  }
+  return parts.join("\n\n");
+}
+
+function truncate(s: string, max: number): string {
+  return s.length <= max ? s : s.slice(0, max - 1) + "…";
 }
 
 function clearOutboundState(s: OutboundState | undefined): void {
@@ -1205,15 +1276,6 @@ function clearOutboundState(s: OutboundState | undefined): void {
 const REASONING_MAX_CHARS = 700;
 const TOOL_RESULT_MAX_LINES = 4;
 const TOOL_RESULT_MAX_CHARS = 280;
-
-function formatReasoningLine(text: string): string {
-  const cleaned = text.trim();
-  if (!cleaned) return "";
-  const truncated = cleaned.length <= REASONING_MAX_CHARS
-    ? cleaned
-    : cleaned.slice(0, REASONING_MAX_CHARS - 1) + "…";
-  return `💭 _Reasoning_\n${truncated}`;
-}
 
 function formatToolResultPreview(result: string): string {
   const trimmed = result.trim();
