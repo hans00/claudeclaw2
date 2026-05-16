@@ -1,36 +1,38 @@
 ---
-description: Deliver a plain-text notification into another channel's inbox (one-way)
+description: Append a latent note to a peer channel's inbox (one-way, no platform message)
 ---
 
-Post a one-way notification to a cross-session target via the daemon's `/api/send` endpoint. The receiving channel's inbox is drained the next time it processes a real user message — so this is "drop a note for them" not "have them respond now".
+Append a JSON line to a peer channel's inbox file via the daemon's `/api/send` endpoint.
 
-If you want the target to actually process the message as a prompt and respond, use `/claudeclaw2:trigger` instead.
+**What this actually does:** the daemon writes `.claude/claudeclaw/inbox/<safeKey>.jsonl`. The next time that exact channel pastes a *real* user turn into its tmux session, the inbox entries are folded into the prompt prefix as a "channel activity since your last turn" block and then the file is deleted. **No platform message is sent by this call.** If the target channel never receives another real turn, the inbox just sits there.
+
+If you want to actually post a message that a human will see on Telegram/Discord/Slack/LINE, use `/claudeclaw2:trigger` instead. See the `cross-session` skill for the full mental model.
 
 ## Args
 
 Parse `$ARGUMENTS` as `<target> <message...>`.
 
-`<target>` grammar:
-- `global` — the cross-platform DM sink
-- `telegram:<chatId>` — numeric, may be negative for groups
-- `discord:<channelId>` — 18–20 digit snowflake
-- `slack:<channelId>` or `slack:<channelId>:<threadTs>`
-- `line:<sourceId>` — userId, groupId, or roomId
+Valid `<target>` (must match an active channel for the note to ever be read):
+- `global` — drained on the global session's next turn
+- `discord:<channelId>` — drained on that channel's next turn
+- `slack:<channelId>[:<threadTs>]`
+- `line:<sourceId>`
+- `telegram:<chatId>` — **dead letter**: Telegram traffic funnels to the `global` channel in v2, so this target is never drained. Use `target=global` if you want a Telegram-related note to be seen by the next turn.
 
 ## Call
 
-Read `.claude/claudeclaw/settings.json` for `web.port` (default 4632), then:
-
 ```bash
-curl -s -X POST http://127.0.0.1:<port>/api/send \
+port=$(jq -r '.web.port // 4632' .claude/claudeclaw/settings.json 2>/dev/null || echo 4632)
+curl -s -X POST "http://127.0.0.1:${port}/api/send" \
   -H "Content-Type: application/json" \
-  -d "$(jq -n --arg t '<target>' --arg m '<message>' '{target:$t, text:$m, fromLabel:"cli"}')"
+  -d "$(jq -n --arg t '<target>' --arg m '<message>' \
+        '{target:$t, text:$m, fromLabel:"cli"}')"
 ```
 
 Use `jq -Rs .` or equivalent to safely JSON-escape multi-line messages.
 
 ## Rules
 
-- One-way only. Do NOT promise that the recipient will respond.
-- Never send sensitive content (tokens, secrets) to a shared channel without confirmation.
-- If the daemon's web API isn't enabled, fall back to writing directly to `.claude/claudeclaw/inbox/<safeKey>.jsonl` as a JSON line: `{"ts":"<iso>","kind":"external","from":"(cli)","text":"<message>"}`.
+- This call is silent — it never produces a visible platform message on its own.
+- Never send sensitive content (tokens, secrets) through this path.
+- If the daemon's web API is disabled, fall back to writing directly: `echo '{"ts":"<iso>","kind":"external","from":"cli","text":"<message>"}' >> .claude/claudeclaw/inbox/<safeKey>.jsonl` where `<safeKey>` is the target with non-alphanumerics replaced by `_`.
