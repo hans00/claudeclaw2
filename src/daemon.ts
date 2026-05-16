@@ -16,6 +16,7 @@ import { composeHeartbeatPrompt, HeartbeatScheduler, loadHeartbeatTemplate, pars
 import type { SourceInfo } from "./channel";
 import { StatuslineWriter } from "./statusline";
 import { backupV1GlobalIfExists, migrateFromV1 } from "./migrate";
+import { appendInbox } from "./inbox";
 import { extractReactions } from "./reactions";
 import { isSilentReplyText, stripSilentToken } from "./silent";
 import { formatToolStatus } from "./tool-display";
@@ -905,6 +906,24 @@ class Daemon {
           freshTextState(claudeMsgId, newId, textToSend),
         );
       }
+
+      // Cross-channel echo: when the reply lands on a chat/channel whose
+      // *own* session is different from the one that produced it (typical
+      // cron pattern: target=global, replyTo=telegram:<group>), append an
+      // inbox entry to the natural owner so it sees the message on its
+      // next turn instead of being surprised by chat history it didn't
+      // create.
+      const ownerKey = inboxOwnerForReplyTo(replyTo);
+      if (ownerKey && ownerKey !== session.channelKey) {
+        await appendInbox(ownerKey, {
+          kind: "trigger-result",
+          from: session.channelKey,
+          text: textToSend,
+          note: `routed via replyTo`,
+        }).catch((err: Error) =>
+          console.error(`[daemon] cross-channel inbox echo failed (${ownerKey}):`, err),
+        );
+      }
     }
 
     await this.applyReactions(replyTo, reactions);
@@ -1584,6 +1603,28 @@ function formatToolResultPreview(result: string): string {
  * a known mismatch with the actual `global` routing — the caller would
  * need to use `global` as target if echoing to global matters.
  */
+/**
+ * Sibling of {@link inboxOwnerForTarget} that takes a structured ReplyTarget
+ * instead of a target string. Used to decide whether a cross-channel reply
+ * should also echo into the natural owner's inbox.
+ */
+function inboxOwnerForReplyTo(replyTo: ReplyTarget): string | null {
+  if (!replyTo) return null;
+  if (replyTo.platform === "telegram") {
+    return inboxOwnerForTarget(`telegram:${replyTo.chatId}`);
+  }
+  if (replyTo.platform === "discord") {
+    return inboxOwnerForTarget(`discord:${replyTo.channelId}`);
+  }
+  if (replyTo.platform === "slack") {
+    return inboxOwnerForTarget(`slack:${replyTo.channelId}`);
+  }
+  if (replyTo.platform === "line") {
+    return inboxOwnerForTarget(`line:${replyTo.to}`);
+  }
+  return null;
+}
+
 function inboxOwnerForTarget(target: string): string | null {
   if (target === GLOBAL_KEY) return null;
   if (target.startsWith("telegram:")) {
