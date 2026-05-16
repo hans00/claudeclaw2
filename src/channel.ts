@@ -95,6 +95,10 @@ const APPROVAL_POLL_MS = 1500;
  *  Telegram's chat-action expires after 5s, Discord's after ~10s. */
 const TYPING_PULSE_MS = 4000;
 
+/** Synthesise turn-end this long after a passthrough slash command if no
+ *  jsonl event came in — covers UI-only commands like `/reload-plugins`. */
+const SLASH_IDLE_TIMEOUT_MS = 2000;
+
 export interface SourceInfo {
   platform: "telegram" | "discord" | "slack" | "line";
   /** Display name (first+last, global_name, etc). */
@@ -252,6 +256,15 @@ export class Channel {
   private interruptTimer: ReturnType<typeof setTimeout> | null = null;
   private typingTimer: ReturnType<typeof setInterval> | null = null;
   private approvalTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Fallback timer for passthrough slash commands. Some Claude Code slash
+   * commands (`/reload-plugins`, `/help`, `/clear`, …) are UI-only and never
+   * touch the conversation jsonl — without a synthetic end-turn the channel
+   * would stay stuck in "running" forever. Cleared the moment any real jsonl
+   * event arrives, since those commands that DO emit jsonl take care of the
+   * turn-end themselves via the classifier path.
+   */
+  private slashIdleTimer: ReturnType<typeof setTimeout> | null = null;
   /** Fingerprint of the dialog we last raised an approval for, so we don't
    *  spam the operator with duplicate prompts each poll. Cleared when the
    *  pane no longer shows a dialog OR the operator responded. */
@@ -359,6 +372,11 @@ export class Channel {
 
   private async onJsonlEvent(ev: JsonlEvent): Promise<void> {
     try {
+      // Any real jsonl event means the slash command did produce output —
+      // cancel the UI-only-slash fallback so its normal handler (classifier
+      // path or end_turn) takes care of the turn-end.
+      this.clearSlashIdleTimer();
+
       // Auto-wake detection: if we receive a fresh assistant event while
       // the channel is idle, the agent has triggered itself (ScheduleWakeup,
       // /loop self-pace, etc) without an inbound paste. Bump state so a
@@ -510,11 +528,37 @@ export class Channel {
       clearTimeout(this.interruptTimer);
       this.interruptTimer = null;
     }
+    this.clearSlashIdleTimer();
     this.stopTypingPulse();
     this.stopApprovalPoll();
     this.state = "idle";
     void this.opts.callbacks.onTurnEnd?.();
     void this.drainQueue();
+  }
+
+  /**
+   * Arm the slash-idle fallback (see field comment). Fires synthetic
+   * turn-end if the slash never produced any jsonl events within the
+   * window — Claude Code UI-only commands like `/reload-plugins`, `/help`,
+   * `/clear` don't touch the session file at all.
+   */
+  private armSlashIdleTimer(): void {
+    this.clearSlashIdleTimer();
+    this.slashIdleTimer = setTimeout(() => {
+      this.slashIdleTimer = null;
+      if (this.state !== "running") return;
+      console.log(
+        `[channel ${this.opts.session.channelKey}] slash command produced no jsonl events — synthesising turn-end`,
+      );
+      this.onTurnEnd();
+    }, SLASH_IDLE_TIMEOUT_MS);
+  }
+
+  private clearSlashIdleTimer(): void {
+    if (this.slashIdleTimer) {
+      clearTimeout(this.slashIdleTimer);
+      this.slashIdleTimer = null;
+    }
   }
 
   /** Inbound message from the platform connector. */
@@ -589,6 +633,7 @@ export class Channel {
     if (isPassthroughSlashCommand(item.text)) {
       this.startTypingPulse();
       this.startApprovalPoll();
+      this.armSlashIdleTimer();
       try {
         await pasteText(target, item.text.trim());
         await new Promise((r) => setTimeout(r, 80));
@@ -597,6 +642,7 @@ export class Channel {
         console.error(`[channel ${this.opts.session.channelKey}] slash paste failed:`, err);
         this.opts.callbacks.onError?.(err as Error);
         this.stopTypingPulse();
+        this.clearSlashIdleTimer();
         this.state = "idle";
       }
       return;
@@ -690,6 +736,7 @@ export class Channel {
     this.tailer = null;
     if (this.interruptTimer) clearTimeout(this.interruptTimer);
     this.interruptTimer = null;
+    this.clearSlashIdleTimer();
     this.stopTypingPulse();
     this.stopApprovalPoll();
     try {
