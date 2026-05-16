@@ -91,26 +91,29 @@ function truncate(s: string, max: number): string {
 export function formatInboxForPrompt(entries: InboxEntry[]): string {
   if (!entries.length) return "";
   const lines: string[] = [
-    "[Channel activity since your last turn — your session was idle while these happened]",
+    "[Activity on this channel since your last turn — including outgoing messages dispatched on your behalf via /api/send. Already-seen context.]",
   ];
   for (const e of entries) {
     const time = e.ts.length >= 16 ? e.ts.slice(11, 16) : e.ts;
     const from = e.from ? ` from ${e.from}` : "";
-    const suffix = e.note ? ` (${e.note})` : "";
+    const noteParens = e.note ? ` (${e.note})` : "";
     let label: string;
     switch (e.kind) {
       case "send":
-        label = `bridge delivered to your channel${from}`;
+        // Outgoing message dispatched via /api/send from this session's
+        // POV — the note carries the target ("to=telegram:123" etc.) and
+        // `from` carries the API caller's fromLabel.
+        label = `you sent${noteParens}${from}`;
         break;
       case "trigger-result":
-        label = `trigger response${from}`;
+        label = `trigger response${from}${noteParens}`;
         break;
       case "external":
       default:
-        label = "system";
+        label = `system${noteParens}`;
         break;
     }
-    lines.push(`- ${time} — ${label}${suffix}: ${truncate(e.text, MAX_TEXT_PREVIEW)}`);
+    lines.push(`- ${time} — ${label}: ${truncate(e.text, MAX_TEXT_PREVIEW)}`);
   }
   lines.push("");
   lines.push(

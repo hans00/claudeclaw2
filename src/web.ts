@@ -58,6 +58,18 @@ export interface WebDaemonView {
   defaultTimezoneOffsetMinutes(): number;
   /** Fire a job immediately (manual run). Returns false if the job is missing. */
   triggerJob(name: string): Promise<boolean>;
+  /**
+   * Send a real platform-side message to the target chat/channel. Used by
+   * `/api/send`. Returns `{ ok: false, error }` if the target's platform
+   * isn't enabled / not addressable from a session.
+   */
+  sendToPlatform(target: string, text: string): Promise<{ ok: boolean; error?: string }>;
+  /**
+   * Which session "owns" inbound traffic from this target — i.e. where to
+   * stash the inbox echo so that session sees it on its next turn.
+   * Returns `null` if the target has no addressable owner (e.g. `global`).
+   */
+  inboxOwnerForTarget(target: string): string | null;
 }
 
 export class WebServer {
@@ -143,12 +155,28 @@ export class WebServer {
         if (!body || typeof body.target !== "string" || typeof body.text !== "string") {
           return this.json({ error: "expected { target, text, fromLabel? }" }, 400);
         }
-        await appendInbox(body.target, {
-          kind: "external",
-          from: body.fromLabel ?? "(api)",
-          text: body.text,
+        // 1. Deliver the message to the actual platform (Telegram/Discord/…).
+        // 2. Record an inbox echo on the channel that owns inbound traffic
+        //    from this target, so its session sees "you sent this earlier"
+        //    next time it's triggered.
+        const dispatch = await this.view.sendToPlatform(body.target, body.text);
+        if (!dispatch.ok) {
+          return this.json({ error: dispatch.error ?? "send failed", target: body.target }, 400);
+        }
+        const ownerKey = this.view.inboxOwnerForTarget(body.target);
+        if (ownerKey) {
+          await appendInbox(ownerKey, {
+            kind: "send",
+            from: body.fromLabel ?? "(api)",
+            text: body.text,
+            note: `to=${body.target}`,
+          });
+        }
+        return this.json({
+          ok: true,
+          target: body.target,
+          inboxOwner: ownerKey,
         });
-        return this.json({ ok: true, delivered: "inbox", target: body.target });
       }
       if (req.method === "POST" && path === "/api/trigger") {
         const body: any = await req.json().catch(() => null);
@@ -157,7 +185,11 @@ export class WebServer {
         }
         const channel = await this.view.resolveChannel(body.target);
         if (!channel) return this.json({ error: `target "${body.target}" not resolvable` }, 404);
-        const replyTo = parseReplyTo(body.replyTo);
+        // If the caller didn't pin a return address, derive one from the
+        // target key when the target is bound to a single platform/channel.
+        // Without this, /api/trigger discord:<id> would run the agent but
+        // its reply would only land in the daemon log.
+        const replyTo = parseReplyTo(body.replyTo) ?? deriveReplyToFromTarget(body.target);
         await channel.handleIncoming({
           text: body.prompt,
           fromLabel: body.fromLabel ?? "(api)",
@@ -589,6 +621,36 @@ function formatReplyToInput(replyTo: ReplyTarget | undefined): string {
   if (replyTo.platform === "slack") return `slack:${replyTo.channelId}${replyTo.threadTs ? `:${replyTo.threadTs}` : ""}`;
   if (replyTo.platform === "line") return `line:${replyTo.to}`;
   return "";
+}
+
+/**
+ * Best-effort `replyTo` from a target key — used when the API caller didn't
+ * supply one. `global` stays null because it has no single platform; every
+ * other kind has an implicit return address baked into the key.
+ *
+ * messageId stays null — we have no inbound message to thread off, so the
+ * reply becomes a new top-level post.
+ */
+function deriveReplyToFromTarget(target: string): ReplyTarget {
+  if (target === "global") return null;
+  if (target.startsWith("telegram:")) {
+    const chatId = Number(target.slice("telegram:".length));
+    if (!Number.isFinite(chatId)) return null;
+    return { platform: "telegram", chatId };
+  }
+  if (target.startsWith("discord:")) {
+    return { platform: "discord", channelId: target.slice("discord:".length) };
+  }
+  if (target.startsWith("slack:")) {
+    const rest = target.slice("slack:".length);
+    const colon = rest.indexOf(":");
+    if (colon < 0) return { platform: "slack", channelId: rest };
+    return { platform: "slack", channelId: rest.slice(0, colon), threadTs: rest.slice(colon + 1) };
+  }
+  if (target.startsWith("line:")) {
+    return { platform: "line", to: target.slice("line:".length) };
+  }
+  return null;
 }
 
 function parseReplyTo(input: unknown): ReplyTarget {

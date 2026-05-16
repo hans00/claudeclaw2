@@ -193,6 +193,8 @@ class Daemon {
       },
       defaultTimezoneOffsetMinutes: () => parseTimezoneOffset(this.settings.timezone),
       triggerJob: (name) => this.triggerJobByName(name),
+      sendToPlatform: (target, text) => this.sendToPlatform(target, text),
+      inboxOwnerForTarget: (target) => inboxOwnerForTarget(target),
     };
     this.web = new WebServer(this.settings.web, view);
     this.web.start();
@@ -349,6 +351,48 @@ class Daemon {
     });
   }
 
+  /**
+   * Deliver a real platform-side message to `target`. Used by `/api/send`.
+   * Returns `{ ok: false }` when the platform is disabled, the target form
+   * is unsupported, or the underlying SDK call fails.
+   */
+  private async sendToPlatform(target: string, text: string): Promise<{ ok: boolean; error?: string }> {
+    if (target === GLOBAL_KEY) {
+      return { ok: false, error: "target=global has no platform to send to — use a specific platform target" };
+    }
+    try {
+      if (target.startsWith("telegram:")) {
+        if (!this.telegram) return { ok: false, error: "telegram platform not enabled" };
+        const chatId = Number(target.slice("telegram:".length));
+        if (!Number.isFinite(chatId)) return { ok: false, error: "invalid telegram chat id" };
+        await this.telegram.sendMessage(chatId, text);
+        return { ok: true };
+      }
+      if (target.startsWith("discord:")) {
+        if (!this.discord) return { ok: false, error: "discord platform not enabled" };
+        await this.discord.sendMessage(target.slice("discord:".length), text);
+        return { ok: true };
+      }
+      if (target.startsWith("slack:")) {
+        if (!this.slack) return { ok: false, error: "slack platform not enabled" };
+        const rest = target.slice("slack:".length);
+        const colon = rest.indexOf(":");
+        const channelId = colon < 0 ? rest : rest.slice(0, colon);
+        const threadTs = colon < 0 ? undefined : rest.slice(colon + 1);
+        await this.slack.sendMessage(channelId, text, threadTs);
+        return { ok: true };
+      }
+      if (target.startsWith("line:")) {
+        if (!this.line) return { ok: false, error: "line platform not enabled" };
+        await this.line.pushText(target.slice("line:".length), text);
+        return { ok: true };
+      }
+      return { ok: false, error: `unsupported target form "${target}"` };
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
+  }
+
   /** Fire a job immediately by name. Returns false if the job is missing. */
   async triggerJobByName(name: string): Promise<boolean> {
     const job = await loadJob(name).catch(() => null);
@@ -377,6 +421,7 @@ class Daemon {
     for (const [key, session] of Object.entries(persisted)) {
       if (
         session.kind !== "global" &&
+        session.kind !== "telegram" &&
         session.kind !== "discord" &&
         session.kind !== "slack" &&
         session.kind !== "line"
@@ -567,15 +612,22 @@ class Daemon {
   }
 
   private async routeTelegram(msg: InboundMessage): Promise<void> {
-    // v1 parity: all Telegram traffic (DM + group) lands on "global".
-    const key = GLOBAL_KEY;
+    // DM (private chat) converges on `global` so it shares the local Claude
+    // Code session like every other platform's DMs do. Groups/supergroups
+    // get their own per-chat `telegram:<chatId>` channel so the conversation
+    // history stays scoped to that group and isn't mixed into the user's
+    // 1:1 context.
+    const isDM = msg.chatType === "private";
+    const key = isDM ? GLOBAL_KEY : `telegram:${msg.chatId}`;
+    const kind = isDM ? "global" : "telegram";
+    const multiparty = !isDM;
     const replyTo: ReplyTarget = {
       platform: "telegram",
       chatId: msg.chatId,
       messageId: msg.messageId,
     };
 
-    const channel = await this.ensureChannel(key, "global", /*multiparty*/ false);
+    const channel = await this.ensureChannel(key, kind, multiparty);
     if (!channel) return;
     await touchActivity(key);
     if (await this.tryHandleCommand(msg.text, channel, replyTo)) return;
@@ -664,7 +716,7 @@ class Daemon {
 
   private async ensureChannel(
     key: string,
-    kind: "global" | "discord" | "slack" | "line",
+    kind: "global" | "telegram" | "discord" | "slack" | "line",
     multiparty: boolean,
   ): Promise<Channel | null> {
     let channel = this.channels.get(key);
@@ -1518,10 +1570,44 @@ function formatToolResultPreview(result: string): string {
   return joined;
 }
 
+/**
+ * Map a `/api/send` target to the session key that handles inbound traffic
+ * from that chat/channel. The inbox echo lands there so the owning session
+ * sees "you sent this earlier" on its next turn.
+ *
+ * Telegram DM chat ids are positive; group/supergroup ids are negative. We
+ * branch on the sign so DM sends echo into `global` (where Telegram DMs
+ * route) and group sends echo into the group's own per-chat channel.
+ *
+ * Discord/Slack/LINE have no reliable id-only DM signal, so the inbox echo
+ * just goes to the same-shape key. For Discord/Slack DM channels this is
+ * a known mismatch with the actual `global` routing — the caller would
+ * need to use `global` as target if echoing to global matters.
+ */
+function inboxOwnerForTarget(target: string): string | null {
+  if (target === GLOBAL_KEY) return null;
+  if (target.startsWith("telegram:")) {
+    const chatId = Number(target.slice("telegram:".length));
+    if (!Number.isFinite(chatId)) return null;
+    return chatId > 0 ? GLOBAL_KEY : target;
+  }
+  if (target.startsWith("slack:")) {
+    // Drop the threadTs suffix — the inbox is per-channel, not per-thread.
+    const rest = target.slice("slack:".length);
+    const colon = rest.indexOf(":");
+    return `slack:${colon < 0 ? rest : rest.slice(0, colon)}`;
+  }
+  if (target.startsWith("discord:") || target.startsWith("line:")) {
+    return target;
+  }
+  return null;
+}
+
 function deriveKindFromKey(
   key: string,
-): { kind: "global" | "discord" | "slack" | "line"; multiparty: boolean } | null {
+): { kind: "global" | "telegram" | "discord" | "slack" | "line"; multiparty: boolean } | null {
   if (key === GLOBAL_KEY) return { kind: "global", multiparty: false };
+  if (key.startsWith("telegram:")) return { kind: "telegram", multiparty: true };
   if (key.startsWith("discord:")) return { kind: "discord", multiparty: true };
   if (key.startsWith("slack:")) return { kind: "slack", multiparty: true };
   if (key.startsWith("line:")) return { kind: "line", multiparty: true };

@@ -1,94 +1,129 @@
 ---
 name: cross-session
-description: Communicate with another ClaudeClaw session — drop a latent note into a peer channel's inbox (`/api/send`) or actually hand off a prompt to a peer agent and have its reply land on a platform (`/api/trigger`). Use when the user asks to "tell the Discord agent", "ping me on Telegram when X finishes", "ask the #dev channel to look at this", "forward this to the other chat", "leave a note for global session", etc. Important quirks: Telegram has no per-chat channel (all traffic funnels to `global`), so `telegram:<chatId>` is NOT a valid target — to surface a message in a Telegram chat you must trigger `global` with `replyTo={platform:"telegram",chatId:…}`. `/api/send` never produces a platform-visible message on its own; it only seeds the next turn's prompt prefix.
+description: Reach another ClaudeClaw session — either send a real platform message (`/api/send`, which also leaves an inbox echo on the session that owns that chat) or trigger another session's AI turn with a prompt (`/api/trigger`). Use when the user asks to "tell the Discord agent", "ping me on Telegram when X finishes", "ask the #dev channel to look at this", "forward this to the other chat", "drop a note for global", etc. Telegram routing: DMs converge on `global`, groups get their own `telegram:<chatId>` channel.
 ---
 
 # Cross-Session Communication
 
-You're inside a ClaudeClaw v2 daemon that runs one `claude` CLI session per channel (global / discord:<id> / slack:<id> / line:<id>) plus a couple of message platforms (Telegram, Discord, Slack, LINE). All sessions share the same project working directory but have isolated conversation history. You can reach peer sessions via two local HTTP endpoints — but their semantics are narrower than the names suggest. Read this skill before using either one.
+ClaudeClaw v2 runs one `claude` CLI session per channel:
 
-## The two endpoints — what they *actually* do
+- `global` — shared by all platform DMs and local Claude Code
+- `telegram:<groupChatId>` — per Telegram group/supergroup
+- `discord:<channelId>` — per Discord channel
+- `slack:<channelId>` — per Slack channel
+- `line:<sourceId>` — per LINE non-DM source
 
-### `POST /api/send` — append to inbox file (latent note)
+Sessions share the same project directory but have isolated conversation history. Two HTTP endpoints let you reach them.
 
-Implementation is one line: `appendInbox(target, { kind:"external", from:fromLabel, text })`. That writes a JSON line into `.claude/claudeclaw/inbox/<safeKey>.jsonl`. **Nothing else happens.**
+## The two endpoints — what each one does
 
-That file is only read when the channel matching `<safeKey>` is about to paste a *new* turn into its tmux session — at that point the entries are folded into a "channel activity since your last turn" block prepended to the prompt body. Then the file is deleted.
+### `POST /api/send` — outgoing platform message + inbox echo
 
-Consequences:
-- **No platform message is sent.** This endpoint never produces a Telegram/Discord/Slack/LINE message on its own.
-- If the target is not an active channel (or never becomes one), the inbox file just sits there forever as a dead letter.
-- **Telegram targets are dead letters.** All inbound Telegram traffic in v2 — DM or group — is routed to the `global` channel; there is no per-chat Telegram channel. So `/api/send target=telegram:<id>` writes to `.claude/claudeclaw/inbox/telegram_<id>.jsonl` which nobody ever drains.
+Sends a real message out to the target chat/channel via that platform's API (`bot.sendMessage` for Telegram, `webhook` for Discord, etc.). **The human on the other end sees it on their phone/computer immediately.**
 
-Use `/api/send` only when:
-- you genuinely want to leave a note that will be folded into the next *real* turn on a known-active channel (`global`, or a discord/slack/line channel that has live traffic)
-- you don't need the recipient agent to wake up or respond immediately
-- you don't need anything to appear on a chat platform
+Side effect: an entry is appended to the inbox of the session that *owns* inbound traffic from this target — so when that session is next triggered, it sees a system note saying "you sent ... earlier" and won't be confused about where the message came from. The inbox owner map:
 
-### `POST /api/trigger` — paste a prompt into a peer channel's session
+| target form                          | platform message goes to              | inbox echo lands on  |
+| ------------------------------------ | ------------------------------------- | -------------------- |
+| `telegram:<positiveChatId>` (DM)     | that Telegram chat                    | `global`             |
+| `telegram:<negativeChatId>` (group)  | that Telegram group                   | `telegram:<chatId>`  |
+| `discord:<channelId>`                | that Discord channel                  | `discord:<channelId>`|
+| `slack:<channelId>[:<threadTs>]`     | that Slack channel/thread             | `slack:<channelId>`  |
+| `line:<sourceId>`                    | that LINE recipient                   | `line:<sourceId>`    |
+| `global`                             | rejected — no platform binding        | —                    |
 
-Implementation: `resolveChannel(target)` → `channel.handleIncoming({ text, fromLabel, replyTo })`. This actually queues a turn on that channel's agent. The agent processes the prompt; any assistant text emissions are routed to `replyTo` (if set) for delivery to a chat platform, or logged-only if `replyTo` is null.
+Use `/api/send` when:
+- you want to **notify someone right now** ("✓ build done", "alert: rate-limit hit")
+- you don't need the recipient agent to respond — you composed the exact text yourself
+- you want the originating session to remember it sent this (the inbox echo)
 
-Consequences:
-- **The target must resolve.** `resolveChannel` accepts: `global`, `discord:<id>`, `slack:<id>`, `line:<id>`. **Telegram is NOT in this list.** `/api/trigger target=telegram:<id>` returns HTTP 404 `{ "error": "target ... not resolvable" }`.
-- For a discord/slack/line target, that channel inherently knows its platform binding, so the agent's reply lands on that channel even without setting `replyTo`.
-- For `target=global`, the global agent has no implicit platform binding — its reply will only reach a platform if you supply `replyTo` with the right `{platform, chatId/channelId/…}`.
+### `POST /api/trigger` — run a peer session's AI turn
+
+Pastes the prompt into a peer channel's `claude` CLI session as if a user had typed it. That session's agent runs a turn, and its assistant text gets routed to a chat platform via `replyTo` (auto-derived from the target key when not supplied).
+
+| target form                         | resolves? | reply lands on                       |
+| ----------------------------------- | --------- | ------------------------------------ |
+| `global`                            | ✓         | nowhere unless `replyTo` is given    |
+| `telegram:<groupChatId>` (group)    | ✓         | that Telegram group (auto-derived)   |
+| `discord:<channelId>`               | ✓         | that Discord channel (auto-derived)  |
+| `slack:<channelId>[:<threadTs>]`    | ✓         | that Slack channel/thread            |
+| `line:<sourceId>`                   | ✓         | that LINE recipient                  |
+| `telegram:<positiveChatId>` (DM)    | spawns phantom channel — don't use | — |
 
 Use `/api/trigger` when:
-- you want a peer agent to actually run something and respond
-- you want the response to be visible on a chat platform
-- you're delegating real work to a session that has the right context for it
+- you want a peer agent to actually **think and respond** to a prompt
+- the recipient should see an agent-composed reply, not a verbatim message
+- you're delegating real work to a session that has the right context
 
-## How to actually ping Telegram
+## Calling shapes
 
-The only path:
+### Discover the port
 
 ```bash
 port=$(jq -r '.web.port // 4632' .claude/claudeclaw/settings.json 2>/dev/null || echo 4632)
-curl -s -X POST "http://127.0.0.1:${port}/api/trigger" \
-  -H "Content-Type: application/json" \
-  -d "$(jq -n --arg p '<prompt for the global agent>' --argjson chat <chatId> \
-        '{target:"global", prompt:$p, fromLabel:"cross-session",
-          replyTo:{platform:"telegram",chatId:$chat,messageId:null}}')"
 ```
 
-This makes the `global` agent run `<prompt>`, then sends its reply to Telegram chat `<chatId>`. There is no daemon-side "just send this exact text to chat X" bypass — the agent always reads + composes the outgoing message.
+### Send (real platform message)
 
-If you want the most lightweight possible ping, hand the agent a one-line prompt like `Reply to the user with exactly: "✓ build done"` — the agent costs you one turn but produces the visible Telegram message.
+```bash
+curl -s -X POST "http://127.0.0.1:${port}/api/send" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg t '<target>' --arg m '<message>' \
+        '{target:$t, text:$m, fromLabel:"cross-session"}')"
+```
 
-## How to actually message a Discord / Slack / LINE channel
+Response: `{"ok":true,"target":"…","inboxOwner":"…"}`. The `inboxOwner` tells you which session got the echo.
 
-That channel HAS its own session, so trigger it directly:
+To ping a Telegram DM (e.g. Hans's chat 116013788):
+
+```bash
+curl -s -X POST "http://127.0.0.1:${port}/api/send" \
+  -H "Content-Type: application/json" \
+  -d '{"target":"telegram:116013788","text":"✓ build done","fromLabel":"cross-session"}'
+```
+
+This delivers the Telegram message immediately AND leaves an inbox echo on `global` so next time `global` runs a turn it sees "you sent ✓ build done to telegram:116013788 earlier".
+
+### Trigger (peer AI turn)
 
 ```bash
 curl -s -X POST "http://127.0.0.1:${port}/api/trigger" \
   -H "Content-Type: application/json" \
-  -d "$(jq -n --arg t 'discord:<channelId>' --arg p '<prompt>' \
+  -d "$(jq -n --arg t '<target>' --arg p '<prompt>' \
         '{target:$t, prompt:$p, fromLabel:"cross-session"}')"
 ```
 
-Discord channels are multiparty so the agent there decides whether to actually reply (NO_REPLY logic applies). If you need the message guaranteed to surface, phrase the prompt as an unambiguous instruction.
+The API auto-derives `replyTo` from the target when you don't supply one, so for `discord:<id>` / `slack:<id>` / `line:<id>` / `telegram:<groupId>` the agent's reply lands on the right platform by default.
 
-## Target grammar — accept/reject matrix
+For `target=global` you usually want the reply on a specific platform — add `replyTo`:
 
-| target form                    | `/api/send` (inbox)         | `/api/trigger` (agent)        |
-| ------------------------------ | --------------------------- | ----------------------------- |
-| `global`                       | ✓ drained next global turn  | ✓ runs on global agent        |
-| `discord:<channelId>`          | ✓ drained on next turn there| ✓ runs on that channel        |
-| `slack:<channelId>[:<threadTs>]` | ✓ drained on next turn    | ✓ runs on that channel        |
-| `line:<sourceId>`              | ✓ drained on next turn      | ✓ runs on that channel        |
-| `telegram:<chatId>`            | ✗ **dead letter**           | ✗ **404 not resolvable**      |
+```bash
+... '{target:"global", prompt:"…", fromLabel:"cross-session",
+       replyTo:{platform:"telegram",chatId:<chatId>}}'
+```
 
-To enumerate live channels, hit `GET /api/sessions`.
+Response is `{"ok":true,"dispatched":true,"target":"…"}` immediately — it's a queue insertion. The agent may take 10+ seconds before the reply actually appears, especially if the channel's tmux is spawning for the first time.
+
+## Picking between send and trigger
+
+| user intent                                                | use         |
+| ---------------------------------------------------------- | ----------- |
+| "ping me on Telegram when X finishes"                      | **send** (you compose the exact text) |
+| "tell Hans the deploy is done"                             | **send**    |
+| "post the test results to #dev"                            | **send**    |
+| "ask the Discord agent to investigate this stack trace"    | **trigger** |
+| "have the global session run the migration script"         | **trigger** |
+| "make the line bot summarise today's logs"                 | **trigger** |
+
+**Rule of thumb:** if you can write the exact message you want delivered, use `send`. If you need the recipient agent to think before responding, use `trigger`.
 
 ## Conventions
 
-- **Port discovery**: `port=$(jq -r '.web.port // 4632' .claude/claudeclaw/settings.json 2>/dev/null || echo 4632)`
-- **`fromLabel`**: identify origin. e.g. `"telegram:<chatId>"`, `"discord:<channelId>"`, `"claude-code:<cwd-basename>"`, or `"cross-session"` as a generic.
+- **`fromLabel`**: identify origin. e.g. `"claude-code:<cwd-basename>"`, `"telegram:<chatId>"`, `"discord:<channelId>"`, or a generic `"cross-session"`.
 - **Build JSON with `jq -n`**, not string concat, so the prompt/message is escaped safely.
-- **Manual triggers are noise for someone.** Don't fire on the user's behalf without them asking — these produce real chat messages humans will see.
-- **Don't loop.** If you receive something via this channel, don't reflexively reply back through the same path.
-- **Watch `.claude/claudeclaw/logs/daemon-v2-*.log`** if a dispatch silently fails or an agent reply doesn't surface.
+- **Manual sends are noise for someone.** Don't fire on the user's behalf without them asking — these produce real chat messages humans see.
+- **Don't loop.** If you just received something via cross-session, don't reflexively send/trigger back through the same path.
+- **Watch `.claude/claudeclaw/logs/daemon-v2-*.log`** if a send or trigger silently fails.
 
 ## Slash command equivalents
 
@@ -97,4 +132,4 @@ The plugin ships these for human use:
 - `/claudeclaw2:send <target> <message>` — wraps `/api/send`
 - `/claudeclaw2:trigger <target> <prompt>` — wraps `/api/trigger`
 
-These inherit the same accept/reject matrix above. When the user types one of them, run it as-is. When you're acting on your own intent, build the curl call directly so you can attach the right `replyTo`.
+When the user explicitly types a slash command, run it as-is. When you're acting on the user's intent, call the API directly so you can shape `fromLabel` and (for trigger to `global`) `replyTo` properly.
