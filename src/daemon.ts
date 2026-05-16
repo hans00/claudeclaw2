@@ -298,11 +298,14 @@ class Daemon {
           const template = await loadHeartbeatTemplate();
           const merged = composeHeartbeatPrompt(template, userPrompt);
           if (!merged) return false;
+          // Same reasoning as cron — wrap so the agent doesn't lose
+          // "this is the periodic heartbeat, not a fresh user ask" after
+          // an auto-compact event.
+          const interval = this.settings.heartbeat.interval;
           await channel.handleIncoming({
             text: merged,
-            fromLabel: "heartbeat",
+            fromLabel: `scheduled · heartbeat (every ${interval}m)`,
             replyTo: null,
-            rawPrompt: true, // v1 parity: heartbeat template fires verbatim
           });
           return true;
         },
@@ -332,11 +335,13 @@ class Daemon {
     const channel = await this.ensureChannel(job.target, meta.kind, meta.multiparty);
     if (!channel) return;
     await touchActivity(job.target);
+    // Wrap with timestamp + scheduled-job source line so context survives a
+    // mid-turn compaction. v1 fired bare body which left the model guessing
+    // whether "整理今天的學習" meant "right now" or "for the daily summary".
     await channel.handleIncoming({
       text: job.body,
-      fromLabel: `cron:${job.name}`,
+      fromLabel: `scheduled · cron · ${job.name} (${job.schedule})`,
       replyTo: job.replyTo,
-      rawPrompt: true, // v1 parity: cron body fires verbatim, no prefix wrap
     });
   }
 
