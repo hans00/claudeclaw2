@@ -46,6 +46,11 @@ interface Frontmatter {
 }
 
 function parseFrontmatter(content: string): Frontmatter {
+  // Normalise CRLF → LF first. Editors on macOS/Windows (and pasted content)
+  // sometimes save with CRLF, which left a trailing \r on every line and made
+  // the key/value regex below silently fail to match — `.` doesn't match \r
+  // and unanchored `$` (no /m flag) only matches end-of-string.
+  content = content.replace(/\r\n?/g, "\n");
   if (!content.startsWith("---")) return { meta: {}, body: content };
   // Match the leading "---\n" then the closing "\n---\n".
   const rest = content.slice(content.indexOf("\n") + 1);
