@@ -11,7 +11,7 @@ import { mkdir, unlink, writeFile } from "fs/promises";
 import { dirname, join } from "path";
 import { Channel, type ChannelCallbacks, type ReplyTarget } from "./channel";
 import { loadSettings, type MessageStreamMode, type Settings } from "./config";
-import { CronScheduler, type Job } from "./jobs";
+import { CronScheduler, loadJob, type Job } from "./jobs";
 import { composeHeartbeatPrompt, HeartbeatScheduler, loadHeartbeatTemplate, parseTimezoneOffset } from "./heartbeat";
 import type { SourceInfo } from "./channel";
 import { StatuslineWriter } from "./statusline";
@@ -192,6 +192,7 @@ class Daemon {
         return this.ensureChannel(target, meta.kind, meta.multiparty);
       },
       defaultTimezoneOffsetMinutes: () => parseTimezoneOffset(this.settings.timezone),
+      triggerJob: (name) => this.triggerJobByName(name),
     };
     this.web = new WebServer(this.settings.web, view);
     this.web.start();
@@ -328,7 +329,7 @@ class Daemon {
     this.cron.start();
   }
 
-  private async fireCronJob(job: Job): Promise<void> {
+  private async fireCronJob(job: Job, manual = false): Promise<void> {
     const meta = deriveKindFromKey(job.target);
     if (!meta) {
       console.error(`[daemon] cron job "${job.name}": unsupported target "${job.target}"`);
@@ -340,11 +341,21 @@ class Daemon {
     // Wrap with timestamp + scheduled-job source line so context survives a
     // mid-turn compaction. v1 fired bare body which left the model guessing
     // whether "整理今天的學習" meant "right now" or "for the daily summary".
+    const sourceTag = manual ? "manual · cron" : "scheduled · cron";
     await channel.handleIncoming({
       text: job.body,
-      fromLabel: `scheduled · cron · ${job.name} (${job.schedule})`,
+      fromLabel: `${sourceTag} · ${job.name} (${job.schedule})`,
       replyTo: job.replyTo,
     });
+  }
+
+  /** Fire a job immediately by name. Returns false if the job is missing. */
+  async triggerJobByName(name: string): Promise<boolean> {
+    const job = await loadJob(name).catch(() => null);
+    if (!job) return false;
+    console.log(`[daemon] manual trigger for cron job "${job.name}" → target=${job.target}`);
+    await this.fireCronJob(job, true);
+    return true;
   }
 
   private async writePidFile(): Promise<void> {

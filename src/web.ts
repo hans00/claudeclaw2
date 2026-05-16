@@ -56,6 +56,8 @@ export interface WebDaemonView {
    * Pulled from `settings.timezone` so hot-reloads are picked up next render.
    */
   defaultTimezoneOffsetMinutes(): number;
+  /** Fire a job immediately (manual run). Returns false if the job is missing. */
+  triggerJob(name: string): Promise<boolean>;
 }
 
 export class WebServer {
@@ -93,13 +95,14 @@ export class WebServer {
       if (req.method === "GET" && path === "/jobs") return this.html(await this.renderJobs());
       if (req.method === "GET" && path === "/jobs/new") return this.html(this.renderJobForm(null, ""));
       if (req.method === "POST" && path === "/jobs") return this.handleJobCreate(req);
-      const jobMatch = path.match(/^\/jobs\/([A-Za-z0-9._-]+)(\/edit|\/delete)?$/);
+      const jobMatch = path.match(/^\/jobs\/([A-Za-z0-9._-]+)(\/edit|\/delete|\/run)?$/);
       if (jobMatch) {
         const [, name, action] = jobMatch;
-        if (req.method === "GET" && !action) return this.html(await this.renderJobView(name));
+        if (req.method === "GET" && !action) return this.html(await this.renderJobView(name, url.searchParams.get("fired") === "1"));
         if (req.method === "GET" && action === "/edit") return this.html(await this.renderJobEdit(name));
         if (req.method === "POST" && !action) return this.handleJobSave(req, name);
         if (req.method === "POST" && action === "/delete") return this.handleJobDelete(name);
+        if (req.method === "POST" && action === "/run") return this.handleJobRun(name);
       }
       if (req.method === "GET" && path === "/logs") return this.html(await this.renderLogsList());
 
@@ -312,6 +315,9 @@ export class WebServer {
         const actions = [
           `<a href="/jobs/${nameEnc}">view</a>`,
           `<a href="/jobs/${nameEnc}/edit">edit</a>`,
+          `<form method="post" action="/jobs/${nameEnc}/run" style="display:inline" ` +
+            `onsubmit="return confirm('Run &quot;${esc(j.name)}&quot; now?')">` +
+            `<button type="submit" class="link">run now</button></form>`,
           `<form method="post" action="/jobs/${nameEnc}/delete" style="display:inline" ` +
             `onsubmit="return confirm('Delete job &quot;${esc(j.name)}&quot;?')">` +
             `<button type="submit" class="link">delete</button></form>`,
@@ -330,7 +336,7 @@ export class WebServer {
     );
   }
 
-  private async renderJobView(name: string): Promise<string> {
+  private async renderJobView(name: string, justFired = false): Promise<string> {
     const job = await loadJob(name).catch(() => null);
     if (!job) return layout("job", `<p><a href="/jobs">← jobs</a></p><p>job not found: <code>${esc(name)}</code></p>`);
     const now = new Date();
@@ -338,11 +344,18 @@ export class WebServer {
     let next = "—";
     try { next = formatDateAtOffset(nextCronMatch(job.schedule, now, tz), tz); } catch {}
     const nameEnc = encodeURIComponent(name);
+    const firedBanner = justFired
+      ? `<p class="fired">✓ fired — check the target channel</p>`
+      : "";
     return layout(
       `job · ${name}`,
       `<p><a href="/jobs">← jobs</a></p>
 <h1>${esc(name)}</h1>
+${firedBanner}
 <p class="dim"><a href="/jobs/${nameEnc}/edit">edit</a> ·
+<form method="post" action="/jobs/${nameEnc}/run" style="display:inline" onsubmit="return confirm('Run now?')">
+  <button type="submit" class="link">run now</button>
+</form> ·
 <form method="post" action="/jobs/${nameEnc}/delete" style="display:inline" onsubmit="return confirm('Delete?')">
   <button type="submit" class="link">delete</button>
 </form></p>
@@ -446,6 +459,16 @@ ${errorMsg ? `<p style="color:#c00">${esc(errorMsg)}</p>` : ""}
     const ok = await deleteJob(name).catch(() => false);
     if (!ok) return new Response("delete failed", { status: 404 });
     return Response.redirect("/jobs", 303);
+  }
+
+  private async handleJobRun(name: string): Promise<Response> {
+    if (!isValidJobName(name)) return new Response("invalid name", { status: 400 });
+    const ok = await this.view.triggerJob(name).catch((err) => {
+      console.error(`[web] manual job run "${name}" failed:`, err);
+      return false;
+    });
+    if (!ok) return new Response("job not found or failed to fire", { status: 404 });
+    return Response.redirect(`/jobs/${encodeURIComponent(name)}?fired=1`, 303);
   }
 
   private async renderLogsList(): Promise<string> {
@@ -612,6 +635,7 @@ code{background:#f3f3f3;padding:0 .3rem;border-radius:3px;font-size:.85em}
 .msg.tool{border-left-color:#f59e0b;background:#fffbeb}
 .msg.result{border-left-color:#94a3b8;background:#f8fafc}
 .day-divider{margin:1rem 0 .3rem;padding:.15rem .4rem;border-top:1px dashed #ddd;font-size:.75em;letter-spacing:.05em;text-transform:uppercase}
+.fired{background:#d1fae5;border-left:3px solid #10b981;padding:.5rem .8rem;margin:.5rem 0;border-radius:0 4px 4px 0;color:#065f46}
 .msg.result.error{border-left-color:#ef4444;background:#fef2f2}
 pre.log{background:#0f1116;color:#cdd6f4;padding:1rem;border-radius:4px;overflow:auto;font-size:.8em;max-height:80vh;white-space:pre-wrap;word-wrap:break-word}
 .form label{display:block;margin:.7rem 0}
