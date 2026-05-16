@@ -298,14 +298,14 @@ class Daemon {
           const template = await loadHeartbeatTemplate();
           const merged = composeHeartbeatPrompt(template, userPrompt);
           if (!merged) return false;
-          // Same reasoning as cron — wrap so the agent doesn't lose
-          // "this is the periodic heartbeat, not a fresh user ask" after
-          // an auto-compact event.
-          const interval = this.settings.heartbeat.interval;
+          // Heartbeat fires verbatim — the template body already frames
+          // itself as a passive "check on pending stuff" prompt and has
+          // been stable in v1's bare-body form.
           await channel.handleIncoming({
             text: merged,
-            fromLabel: `scheduled · heartbeat (every ${interval}m)`,
+            fromLabel: "heartbeat",
             replyTo: null,
+            rawPrompt: true,
           });
           return true;
         },
