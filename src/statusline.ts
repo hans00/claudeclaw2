@@ -71,7 +71,7 @@ export class StatuslineWriter {
       const all = await loadJobs();
       const now = new Date();
       for (const j of all) {
-        const tz = j.timezoneOffsetMinutes || tzOffset;
+        const tz = j.timezoneOffsetMinutes ?? tzOffset;
         try {
           const next = nextCronMatch(j.schedule, now, tz);
           jobs.push({ name: j.name, nextAt: next.getTime() });

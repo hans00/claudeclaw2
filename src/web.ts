@@ -50,6 +50,12 @@ export interface WebDaemonView {
   startedAt: number;
   listChannels(): SessionView[];
   resolveChannel(target: string): Promise<Channel | null>;
+  /**
+   * Effective display timezone (minutes from UTC). Used to format timestamps
+   * and as the default for jobs that don't specify their own `timezone:`.
+   * Pulled from `settings.timezone` so hot-reloads are picked up next render.
+   */
+  defaultTimezoneOffsetMinutes(): number;
 }
 
 export class WebServer {
@@ -181,11 +187,13 @@ export class WebServer {
 
   private async renderHome(): Promise<string> {
     const channels = await this.mergedSessions();
+    const tz = this.view.defaultTimezoneOffsetMinutes();
     const rows = channels
       .map(
         (c) =>
           `<tr><td><a href="/sessions/${encodeURIComponent(c.channelKey)}">${esc(c.channelKey)}</a></td>` +
-            `<td>${esc(c.kind)}</td><td>${esc(c.state)}</td><td>${esc(c.lastActivityAt)}</td>` +
+            `<td>${esc(c.kind)}</td><td>${esc(c.state)}</td>` +
+            `<td>${esc(formatIsoAtOffset(c.lastActivityAt, tz))}</td>` +
             `<td><code>${esc(c.sessionId.slice(0, 8))}</code></td></tr>`,
       )
       .join("\n");
@@ -223,9 +231,21 @@ export class WebServer {
     const total = events.length;
     const sliced = events.slice(Math.max(0, total - limit));
     const truncated = total - sliced.length;
+    const tz = this.view.defaultTimezoneOffsetMinutes();
     const blocks: string[] = [];
+    let lastDay = "";
     for (const ev of sliced) {
-      const time = ev.timestamp ? esc(ev.timestamp.slice(11, 19)) : "";
+      const formatted = ev.timestamp ? formatIsoAtOffset(ev.timestamp, tz) : "";
+      // Show "YYYY-MM-DD" once per day-change, then HH:MM:SS on subsequent
+      // rows — keeps the column narrow while preserving full local-time context.
+      const day = formatted.slice(0, 10);
+      const hms = formatted.slice(11, 19);
+      const tzSuffix = formatted.slice(20);
+      if (day && day !== lastDay) {
+        blocks.push(`<div class="day-divider dim">${esc(day)} ${esc(tzSuffix)}</div>`);
+        lastDay = day;
+      }
+      const time = esc(hms);
       switch (ev.type) {
         case "user-message":
           blocks.push(
@@ -280,11 +300,13 @@ export class WebServer {
   private async renderJobs(): Promise<string> {
     const jobs = await loadJobs().catch(() => [] as Job[]);
     const now = new Date();
+    const defaultTz = this.view.defaultTimezoneOffsetMinutes();
     const rows = jobs
       .map((j) => {
+        const tz = j.timezoneOffsetMinutes ?? defaultTz;
         let next = "—";
         try {
-          next = new Date(nextCronMatch(j.schedule, now, j.timezoneOffsetMinutes)).toISOString();
+          next = formatDateAtOffset(nextCronMatch(j.schedule, now, tz), tz);
         } catch {}
         const nameEnc = encodeURIComponent(j.name);
         const actions = [
@@ -312,8 +334,9 @@ export class WebServer {
     const job = await loadJob(name).catch(() => null);
     if (!job) return layout("job", `<p><a href="/jobs">← jobs</a></p><p>job not found: <code>${esc(name)}</code></p>`);
     const now = new Date();
+    const tz = job.timezoneOffsetMinutes ?? this.view.defaultTimezoneOffsetMinutes();
     let next = "—";
-    try { next = new Date(nextCronMatch(job.schedule, now, job.timezoneOffsetMinutes)).toISOString(); } catch {}
+    try { next = formatDateAtOffset(nextCronMatch(job.schedule, now, tz), tz); } catch {}
     const nameEnc = encodeURIComponent(name);
     return layout(
       `job · ${name}`,
@@ -446,9 +469,10 @@ ${errorMsg ? `<p style="color:#c00">${esc(errorMsg)}</p>` : ""}
     stats.sort((a, b) => b.mtime - a.mtime);
     const shown = stats.slice(0, MAX);
     const hidden = stats.length - shown.length;
+    const tz = this.view.defaultTimezoneOffsetMinutes();
     const rows = shown.map(
       ({ n, size, mtime }) => {
-        const when = mtime ? new Date(mtime).toISOString().slice(0, 19).replace("T", " ") : "?";
+        const when = mtime ? formatDateAtOffset(new Date(mtime), tz) : "?";
         return `<tr><td><a href="/logs/${encodeURIComponent(n)}">${esc(n)}</a></td><td>${formatBytes(size)}</td><td class="dim">${when}</td></tr>`;
       },
     );
@@ -587,6 +611,7 @@ code{background:#f3f3f3;padding:0 .3rem;border-radius:3px;font-size:.85em}
 .msg.thinking{border-left-color:#a78bfa;background:#f5f3ff;color:#666;font-style:italic}
 .msg.tool{border-left-color:#f59e0b;background:#fffbeb}
 .msg.result{border-left-color:#94a3b8;background:#f8fafc}
+.day-divider{margin:1rem 0 .3rem;padding:.15rem .4rem;border-top:1px dashed #ddd;font-size:.75em;letter-spacing:.05em;text-transform:uppercase}
 .msg.result.error{border-left-color:#ef4444;background:#fef2f2}
 pre.log{background:#0f1116;color:#cdd6f4;padding:1rem;border-radius:4px;overflow:auto;font-size:.8em;max-height:80vh;white-space:pre-wrap;word-wrap:break-word}
 .form label{display:block;margin:.7rem 0}
@@ -616,4 +641,39 @@ function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function pad2(n: number): string { return String(n).padStart(2, "0"); }
+
+/** Render an offset like +480 → "+08:00", -330 → "-05:30", 0 → "Z". */
+function formatTzSuffix(tzMinutes: number): string {
+  if (tzMinutes === 0) return "Z";
+  const sign = tzMinutes > 0 ? "+" : "-";
+  const abs = Math.abs(tzMinutes);
+  return `${sign}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
+}
+
+/**
+ * Format a Date in a given fixed offset (minutes from UTC) as
+ * "YYYY-MM-DD HH:MM:SS ±HH:MM". Pure arithmetic — no Intl, no dependency on
+ * the host's local zone.
+ */
+function formatDateAtOffset(d: Date, tzMinutes: number, includeSeconds = true): string {
+  const shifted = new Date(d.getTime() + tzMinutes * 60_000);
+  const Y = shifted.getUTCFullYear();
+  const M = pad2(shifted.getUTCMonth() + 1);
+  const D = pad2(shifted.getUTCDate());
+  const h = pad2(shifted.getUTCHours());
+  const m = pad2(shifted.getUTCMinutes());
+  const s = pad2(shifted.getUTCSeconds());
+  const time = includeSeconds ? `${h}:${m}:${s}` : `${h}:${m}`;
+  return `${Y}-${M}-${D} ${time} ${formatTzSuffix(tzMinutes)}`;
+}
+
+/** Same as above but starts from a jsonl ISO timestamp string. */
+function formatIsoAtOffset(iso: string | undefined, tzMinutes: number, includeSeconds = true): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return formatDateAtOffset(d, tzMinutes, includeSeconds);
 }

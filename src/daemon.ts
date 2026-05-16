@@ -191,6 +191,7 @@ class Daemon {
         if (!meta) return null;
         return this.ensureChannel(target, meta.kind, meta.multiparty);
       },
+      defaultTimezoneOffsetMinutes: () => parseTimezoneOffset(this.settings.timezone),
     };
     this.web = new WebServer(this.settings.web, view);
     this.web.start();
@@ -322,6 +323,7 @@ class Daemon {
   private startCron(): void {
     this.cron = new CronScheduler({
       fire: (job) => this.fireCronJob(job),
+      defaultTimezoneOffsetMinutes: () => parseTimezoneOffset(this.settings.timezone),
     });
     this.cron.start();
   }

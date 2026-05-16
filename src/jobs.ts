@@ -32,7 +32,11 @@ export interface Job {
   recurring: boolean;
   target: string;
   replyTo: ReplyTarget;
-  timezoneOffsetMinutes: number;
+  /**
+   * Explicit per-job timezone override (minutes from UTC).
+   * `undefined` = no override, consumers should fall back to settings.timezone.
+   */
+  timezoneOffsetMinutes?: number;
   body: string;
 }
 
@@ -84,13 +88,18 @@ function parseReplyTo(value: string | undefined): ReplyTarget {
   return null;
 }
 
-/** Parse "+08:00" / "-05:30" / "UTC" / "" into minutes. */
-function parseTimezone(value: string | undefined): number {
-  if (!value) return 0;
+/**
+ * Parse "+08:00" / "-05:30" / "UTC" / "" into minutes. Returns `undefined`
+ * for missing/unrecognised input so the caller can fall back to a default
+ * (settings.timezone) instead of silently coercing to UTC.
+ */
+function parseTimezone(value: string | undefined): number | undefined {
+  if (!value) return undefined;
   const v = value.trim();
-  if (!v || v.toUpperCase() === "UTC") return 0;
+  if (!v) return undefined;
+  if (v.toUpperCase() === "UTC") return 0;
   const m = /^([+-])(\d{1,2}):?(\d{2})?$/.exec(v);
-  if (!m) return 0;
+  if (!m) return undefined;
   const sign = m[1] === "-" ? -1 : 1;
   const hh = Number(m[2]);
   const mm = Number(m[3] ?? "0");
@@ -218,6 +227,8 @@ export async function loadJobs(): Promise<Job[]> {
 
 export interface SchedulerHooks {
   fire(job: Job): Promise<void>;
+  /** Effective default tz when a job has no explicit `timezone:` frontmatter. */
+  defaultTimezoneOffsetMinutes(): number;
 }
 
 export class CronScheduler {
@@ -253,10 +264,12 @@ export class CronScheduler {
       console.error("[cron] loadJobs failed:", err);
       return;
     }
+    const defaultTz = this.hooks.defaultTimezoneOffsetMinutes();
     for (const job of jobs) {
       let matches: boolean;
+      const tz = job.timezoneOffsetMinutes ?? defaultTz;
       try {
-        matches = cronMatches(job.schedule, now, job.timezoneOffsetMinutes);
+        matches = cronMatches(job.schedule, now, tz);
       } catch (err) {
         console.error(`[cron] ${job.name}: bad schedule "${job.schedule}":`, err);
         continue;
