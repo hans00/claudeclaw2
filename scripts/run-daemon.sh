@@ -17,8 +17,7 @@ cd "$PROJECT_DIR"
 echo "[supervisor] starting daemon (project=$PROJECT_DIR)"
 
 while true; do
-  bun "$DAEMON_SCRIPT" || true
-  code=$?
+  bun "$DAEMON_SCRIPT" && code=0 || code=$?
   if [ "$code" -eq 0 ]; then
     echo "[supervisor] daemon exited cleanly — stopping"
     break
