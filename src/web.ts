@@ -59,7 +59,7 @@ export interface WebDaemonView {
   /** Fire a job immediately (manual run). Returns false if the job is missing. */
   triggerJob(name: string): Promise<boolean>;
   /** Trigger a graceful daemon restart (exit 75 for supervisor loop). No-op if not supported. */
-  restartDaemon?(): void;
+  restartDaemon?(ctx?: { reason?: string; replyTo?: string }): void;
   /**
    * Send a real platform-side message to the target chat/channel. Used by
    * `/api/send`. Returns `{ ok: false, error }` if the target's platform
@@ -225,8 +225,12 @@ export class WebServer {
       if (req.method === "POST" && path === "/api/restart") {
         const restart = this.view.restartDaemon;
         if (!restart) return this.json({ error: "restart not supported" }, 501);
-        setTimeout(() => restart(), 100);
-        return this.json({ ok: true, restarting: true });
+        const body: any = await req.json().catch(() => null);
+        const ctx: { reason?: string; replyTo?: string } = {};
+        if (typeof body?.reason === "string" && body.reason) ctx.reason = body.reason;
+        if (typeof body?.replyTo === "string" && body.replyTo) ctx.replyTo = body.replyTo;
+        setTimeout(() => restart(ctx), 100);
+        return this.json({ ok: true, restarting: true, ...ctx });
       }
       return this.json({ error: "not found" }, 404);
     } catch (err) {

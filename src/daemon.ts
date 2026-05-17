@@ -24,6 +24,7 @@ import { formatToolStatus } from "./tool-display";
 
 const PID_FILE = join(".claude", "claudeclaw", "daemon.pid");
 const SETTINGS_PATH = join(".claude", "claudeclaw", "settings.json");
+const RESTART_PENDING_PATH = join(".claude", "claudeclaw", "restart-pending.json");
 import {
   GLOBAL_KEY,
   loadSessions,
@@ -95,8 +96,8 @@ class Daemon {
     this.watchSettings();
     this.installSignalHandlers();
     console.log(`[daemon] ready (project=${this.projectDir})`);
-    // Discover plugin slash commands and push to platforms (non-blocking).
     void this.syncPlatformCommands();
+    void this.checkRestartContext();
   }
 
   /**
@@ -202,9 +203,12 @@ class Daemon {
       triggerJob: (name) => this.triggerJobByName(name),
       sendToPlatform: (target, text) => this.sendToPlatform(target, text),
       inboxOwnerForTarget: (target) => inboxOwnerForTarget(target),
-      restartDaemon: () => {
-        console.log("[daemon] restart requested via API");
-        setTimeout(() => this.shutdown("api-restart", 75), 100);
+      restartDaemon: (ctx) => {
+        console.log("[daemon] restart requested via API", ctx?.reason ? `(reason: ${ctx.reason})` : "");
+        if (ctx?.reason || ctx?.replyTo) {
+          void writeFile(RESTART_PENDING_PATH, JSON.stringify({ ...ctx, timestamp: new Date().toISOString() }));
+        }
+        setTimeout(() => this.shutdown("api-restart", 75), 150);
       },
     };
     this.web = new WebServer(this.settings.web, view, this.authToken);
@@ -224,6 +228,33 @@ class Daemon {
     await writeFile(tokenPath, token, { mode: 0o600 });
     console.log(`[web] generated auth token → ${tokenPath}`);
     return token;
+  }
+
+  private async checkRestartContext(): Promise<void> {
+    let ctx: { reason?: string; replyTo?: string; timestamp?: string };
+    try {
+      const raw = await Bun.file(RESTART_PENDING_PATH).text();
+      ctx = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    // Remove the file before sending so a crash during send doesn't loop.
+    await unlink(RESTART_PENDING_PATH).catch(() => {});
+    if (!ctx.replyTo && !ctx.reason) return;
+    const age = ctx.timestamp ? Date.now() - new Date(ctx.timestamp).getTime() : 0;
+    if (age > 5 * 60 * 1000) {
+      console.log("[daemon] restart-pending too old, skipping");
+      return;
+    }
+    const parts: string[] = ["✅ 重啟完成"];
+    if (ctx.reason) parts.push(`原因：${ctx.reason}`);
+    const text = parts.join("\n");
+    if (ctx.replyTo) {
+      const result = await this.sendToPlatform(ctx.replyTo, text);
+      if (!result.ok) {
+        console.warn(`[daemon] restart context send failed: ${result.error}`);
+      }
+    }
   }
 
   private snapshotChannels(): SessionView[] {
