@@ -11,7 +11,7 @@
 import { mkdir, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
-import type { AgenticConfig } from "./config";
+import type { AgenticConfig, QueueConfig } from "./config";
 import { parsePermissionDialog, type PermissionDialog } from "./approval";
 import { buildClaudeArgs, type SecurityConfig } from "./compose";
 import { drainInbox, formatInboxForPrompt } from "./inbox";
@@ -130,6 +130,8 @@ export interface QueueItem {
   /** Paste text verbatim, skipping the `[ts][source]\nMessage:` wrapper.
    *  Used for cron + heartbeat firings to match v1 behaviour. */
   rawPrompt?: boolean;
+  /** When this item entered the queue. Set automatically by handleIncoming(). */
+  receivedAt?: Date;
 }
 
 export interface ChannelOptions {
@@ -137,8 +139,8 @@ export interface ChannelOptions {
   security: SecurityConfig;
   projectDir: string;
   callbacks: ChannelCallbacks;
-  /** Auto-interrupt the running turn when a new message arrives. Default false. */
-  autoInterrupt?: boolean;
+  /** Busy-channel queue behaviour (mode, debounce, cap, drop). */
+  queue?: QueueConfig;
   /** How long to wait after Esc before forcing state=idle. Default 5_000. */
   interruptSettleMs?: number;
   /** Default model — passed via --model at spawn. Empty = Claude Code default. */
@@ -260,6 +262,12 @@ function shellQuote(s: string): string {
 export class Channel {
   private state: ChannelState = "spawning";
   private queue: QueueItem[] = [];
+  /** Timestamps of the last enqueue, for debounce calculation. */
+  private lastEnqueuedAt = 0;
+  /** Summary lines for messages that overflowed the cap (for drop policy "summarize"). */
+  private droppedSummaries: string[] = [];
+  /** Count of messages dropped due to cap overflow. */
+  private droppedCount = 0;
   private tailer: TailHandle | null = null;
   private interruptTimer: ReturnType<typeof setTimeout> | null = null;
   private typingTimer: ReturnType<typeof setInterval> | null = null;
@@ -610,6 +618,13 @@ export class Channel {
       pane = await capturePane(this.opts.session.tmuxSession);
     } catch {}
 
+    // Context compaction produces no jsonl output but is not a stall.
+    // Skip diagnosis and recovery — just recheck until compaction finishes.
+    if (/Compacting conversation/i.test(pane)) {
+      this.stallTimer = setTimeout(() => void this.onStall(), 60_000);
+      return;
+    }
+
     await this.writeStallDiagnosis(pane, stallMs);
 
     const atPrompt = /❯\s*$/.test(pane.trimEnd()) || />\s*$/.test(pane.trimEnd());
@@ -660,15 +675,35 @@ export class Channel {
 
   /** Inbound message from the platform connector. */
   async handleIncoming(item: QueueItem): Promise<void> {
+    item.receivedAt = new Date();
     if (this.state === "idle") {
       await this.paste(item);
       return;
     }
-    // spawning, running, interrupting → queue
-    this.queue.push(item);
-    if (this.state === "running" && this.opts.autoInterrupt) {
+    // spawning, running, interrupting → enqueue with cap enforcement
+    this.enqueue(item);
+    if (this.state === "running" && this.opts.queue?.mode === "interrupt") {
       await this.beginInterrupt(/*keepQueue*/ true);
     }
+  }
+
+  private enqueue(item: QueueItem): void {
+    const cfg = this.opts.queue;
+    const cap = cfg?.cap ?? 20;
+    const dropPolicy = cfg?.dropPolicy ?? "summarize";
+    this.lastEnqueuedAt = Date.now();
+    if (this.queue.length >= cap) {
+      if (dropPolicy === "new") return; // reject incoming
+      // drop oldest, optionally summarise it
+      const dropped = this.queue.splice(0, this.queue.length - cap + 1);
+      if (dropPolicy === "summarize") {
+        for (const d of dropped) {
+          this.droppedCount++;
+          this.droppedSummaries.push(d.text.replace(/\s+/g, " ").slice(0, 160));
+        }
+      }
+    }
+    this.queue.push(item);
   }
 
   /** User-initiated /stop. */
@@ -698,21 +733,49 @@ export class Channel {
   private async drainQueue(): Promise<void> {
     if (this.state !== "idle") return;
     if (this.queue.length === 0) return;
+    const debounceMs = this.opts.queue?.debounceMs ?? 1500;
+    if (debounceMs > 0) {
+      const waitMs = debounceMs - (Date.now() - this.lastEnqueuedAt);
+      if (waitMs > 0) {
+        await new Promise<void>((r) => setTimeout(r, waitMs));
+      }
+      // re-check after debounce — new messages may have arrived
+      if (this.state !== "idle") return;
+    }
+    if (this.queue.length === 0) return;
     const merged = this.mergeQueue();
     this.queue = [];
+    this.droppedSummaries = [];
+    this.droppedCount = 0;
     await this.paste(merged);
   }
 
   private mergeQueue(): QueueItem {
-    if (this.queue.length === 1) return this.queue[0];
-    const parts: string[] = [];
-    for (const item of this.queue) {
-      const head = item.fromLabel ? `[${item.fromLabel}] ` : "";
-      parts.push(head + item.text);
+    if (this.queue.length === 1 && this.droppedCount === 0) return this.queue[0];
+    const tz = this.opts.timezoneOffsetMinutes ?? 0;
+    const blocks: string[] = ["[Queued messages while agent was busy]"];
+
+    if (this.droppedCount > 0) {
+      const lines = [
+        `[${this.droppedCount} earlier message${this.droppedCount === 1 ? "" : "s"} dropped due to queue cap]`,
+      ];
+      for (const s of this.droppedSummaries) lines.push(`  - ${s}`);
+      blocks.push(lines.join("\n"));
     }
+
+    for (let i = 0; i < this.queue.length; i++) {
+      const item = this.queue[i];
+      const stamp = item.receivedAt ? formatTimestamp(item.receivedAt, tz) : "";
+      const sourceLine = renderSourceLine(item);
+      const header = [stamp ? `[${stamp}]` : "", sourceLine].filter(Boolean).join("\n");
+      const body = item.rawPrompt ? item.text : `Message: ${item.text}`;
+      blocks.push(`---\nQueued #${i + 1}\n${header}\n${body}`);
+    }
+
     const last = this.queue[this.queue.length - 1];
     return {
-      text: parts.join("\n\n---\n\n"),
+      text: blocks.join("\n\n"),
+      rawPrompt: true,
       platformMsgId: last?.platformMsgId,
       replyTo: last?.replyTo ?? null,
     };

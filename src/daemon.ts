@@ -898,6 +898,7 @@ class Daemon {
       callbacks,
       defaultModel: this.settings.model,
       agentic: this.settings.agentic,
+      queue: this.settings.queue,
       timezoneOffsetMinutes: parseTimezoneOffset(this.settings.timezone),
     });
   }

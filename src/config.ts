@@ -128,6 +128,30 @@ export interface AgenticConfig {
   modes: AgenticMode[];
 }
 
+/**
+ * How the channel handles new inbound messages while the agent is mid-turn.
+ *
+ *   "queue"     — queue + auto-merge: hold messages, then coalesce them into
+ *                 one bundled prompt after the turn ends (default)
+ *   "interrupt" — immediately send ESC, then deliver queued messages once
+ *                 the turn settles
+ */
+export type QueueMode = "queue" | "interrupt";
+export type QueueDropPolicy = "old" | "new" | "summarize";
+
+export interface QueueConfig {
+  mode: QueueMode;
+  /** Wait this long after the last enqueued message before draining. Gives
+   *  rapid-fire messages a chance to coalesce before they hit the agent.
+   *  Default 1500 ms. */
+  debounceMs: number;
+  /** Maximum number of messages to hold in the queue. Default 20. */
+  cap: number;
+  /** What to drop when cap is hit. "summarize" preserves a one-line summary
+   *  of each dropped message. Default "summarize". */
+  dropPolicy: QueueDropPolicy;
+}
+
 export interface Settings {
   telegram: TelegramConfig;
   discord: DiscordConfig;
@@ -146,6 +170,8 @@ export interface Settings {
   telegramPollSeconds: number;
   /** Timezone for heartbeat exclude windows + cron with no override. e.g. "UTC+8". */
   timezone: string;
+  /** Busy-channel queue behaviour. */
+  queue: QueueConfig;
 }
 
 const SETTINGS_PATH = join(".claude", "claudeclaw", "settings.json");
@@ -171,6 +197,7 @@ const DEFAULTS: Settings = {
   agentic: { enabled: false, defaultMode: "", modes: [] },
   telegramPollSeconds: 25,
   timezone: "",
+  queue: { mode: "queue", debounceMs: 1500, cap: 20, dropPolicy: "summarize" },
 };
 
 function parseStreamCfg(raw: any): MessageStreamConfig | undefined {
@@ -320,5 +347,23 @@ export async function loadSettings(): Promise<Settings> {
       ? raw.telegramPollSeconds
       : DEFAULTS.telegramPollSeconds,
     timezone: typeof raw?.timezone === "string" ? raw.timezone : DEFAULTS.timezone,
+    queue: (() => {
+      const q = raw?.queue;
+      const mode: QueueMode =
+        q?.mode === "interrupt" ? "interrupt" : DEFAULTS.queue.mode;
+      const debounceMs =
+        typeof q?.debounceMs === "number" && q.debounceMs >= 0
+          ? q.debounceMs
+          : DEFAULTS.queue.debounceMs;
+      const cap =
+        typeof q?.cap === "number" && q.cap > 0
+          ? Math.floor(q.cap)
+          : DEFAULTS.queue.cap;
+      const dropPolicy: QueueDropPolicy =
+        q?.dropPolicy === "old" || q?.dropPolicy === "new" || q?.dropPolicy === "summarize"
+          ? q.dropPolicy
+          : DEFAULTS.queue.dropPolicy;
+      return { mode, debounceMs, cap, dropPolicy };
+    })(),
   };
 }
