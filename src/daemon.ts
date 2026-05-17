@@ -238,23 +238,32 @@ class Daemon {
     } catch {
       return;
     }
-    // Remove the file before sending so a crash during send doesn't loop.
     await unlink(RESTART_PENDING_PATH).catch(() => {});
-    if (!ctx.replyTo && !ctx.reason) return;
+    if (!ctx.replyTo) return;
     const age = ctx.timestamp ? Date.now() - new Date(ctx.timestamp).getTime() : 0;
     if (age > 5 * 60 * 1000) {
       console.log("[daemon] restart-pending too old, skipping");
       return;
     }
-    const parts: string[] = ["✅ 重啟完成"];
-    if (ctx.reason) parts.push(`原因：${ctx.reason}`);
-    const text = parts.join("\n");
-    if (ctx.replyTo) {
-      const result = await this.sendToPlatform(ctx.replyTo, text);
-      if (!result.ok) {
-        console.warn(`[daemon] restart context send failed: ${result.error}`);
-      }
+    // Route through the channel that owns inbound traffic from this target,
+    // so the restart notification goes through the AI session (tmux) and gets
+    // the AI's natural response, then out to the platform via replyTo.
+    const channelKey = inboxOwnerForTarget(ctx.replyTo) ?? ctx.replyTo;
+    const meta = deriveKindFromKey(channelKey);
+    if (!meta) {
+      console.warn(`[daemon] restart-pending: cannot resolve channel for replyTo=${ctx.replyTo}`);
+      return;
     }
+    const channel = await this.ensureChannel(channelKey, meta.kind, meta.multiparty);
+    if (!channel) return;
+    const replyTo = parseReplyToFromString(ctx.replyTo);
+    const parts: string[] = ["[daemon 已重啟]"];
+    if (ctx.reason) parts.push(`重啟原因：${ctx.reason}`);
+    await channel.handleIncoming({
+      text: parts.join("\n"),
+      fromLabel: "daemon-restart",
+      replyTo,
+    });
   }
 
   private snapshotChannels(): SessionView[] {
@@ -1730,6 +1739,27 @@ function inboxOwnerForTarget(target: string): string | null {
   }
   if (target.startsWith("discord:") || target.startsWith("line:")) {
     return target;
+  }
+  return null;
+}
+
+function parseReplyToFromString(target: string): ReplyTarget {
+  if (target.startsWith("telegram:")) {
+    const chatId = Number(target.slice("telegram:".length));
+    if (Number.isFinite(chatId)) return { platform: "telegram", chatId };
+  }
+  if (target.startsWith("discord:")) {
+    return { platform: "discord", channelId: target.slice("discord:".length) };
+  }
+  if (target.startsWith("slack:")) {
+    const rest = target.slice("slack:".length);
+    const colon = rest.indexOf(":");
+    return colon < 0
+      ? { platform: "slack", channelId: rest }
+      : { platform: "slack", channelId: rest.slice(0, colon), threadTs: rest.slice(colon + 1) };
+  }
+  if (target.startsWith("line:")) {
+    return { platform: "line", to: target.slice("line:".length) };
   }
   return null;
 }
