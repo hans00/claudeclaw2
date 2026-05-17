@@ -257,8 +257,8 @@ class Daemon {
     const channel = await this.ensureChannel(channelKey, meta.kind, meta.multiparty);
     if (!channel) return;
     const replyTo = parseReplyToFromString(ctx.replyTo);
-    const parts: string[] = ["[daemon 已重啟]"];
-    if (ctx.reason) parts.push(`重啟原因：${ctx.reason}`);
+    const parts: string[] = ["[daemon restarted]"];
+    if (ctx.reason) parts.push(`reason: ${ctx.reason}`);
     await channel.handleIncoming({
       text: parts.join("\n"),
       fromLabel: "daemon-restart",
@@ -408,7 +408,7 @@ class Daemon {
     await touchActivity(job.target);
     // Wrap with timestamp + scheduled-job source line so context survives a
     // mid-turn compaction. v1 fired bare body which left the model guessing
-    // whether "整理今天的學習" meant "right now" or "for the daily summary".
+    // whether the prompt meant "right now" or "for the daily summary".
     const sourceTag = manual ? "manual · cron" : "scheduled · cron";
     await channel.handleIncoming({
       text: job.body,

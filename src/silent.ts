@@ -13,7 +13,7 @@
 export const SILENT_REPLY_TOKEN = "NO_REPLY";
 
 const WRAP_CHARS = "`\"'*_~";
-const END_PUNCT = ".!?;:。！？；：,，";
+const END_PUNCT = ".!?;:。！？；：,，"; // CJK punctuation intentional — matches CJK-language replies
 const LEAD_RE = new RegExp(`^[${WRAP_CHARS}\\s]+`);
 const TAIL_RE = new RegExp(`[${WRAP_CHARS}${END_PUNCT}\\s]+$`);
 const EXACT_RE = /^\s*NO_REPLY\s*$/;
