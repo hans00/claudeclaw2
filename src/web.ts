@@ -15,7 +15,7 @@
  *
  * No auth — bound to 127.0.0.1 by default.
  */
-import { readdir, readFile, stat } from "fs/promises";
+import { readdir, readFile, stat, unlink } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
 import { appendInbox } from "./inbox";
@@ -58,6 +58,8 @@ export interface WebDaemonView {
   defaultTimezoneOffsetMinutes(): number;
   /** Fire a job immediately (manual run). Returns false if the job is missing. */
   triggerJob(name: string): Promise<boolean>;
+  /** Trigger a graceful daemon restart (exit 75 for supervisor loop). No-op if not supported. */
+  restartDaemon?(): void;
   /**
    * Send a real platform-side message to the target chat/channel. Used by
    * `/api/send`. Returns `{ ok: false, error }` if the target's platform
@@ -74,10 +76,13 @@ export interface WebDaemonView {
 
 export class WebServer {
   private server: ReturnType<typeof Bun.serve> | null = null;
+  private ipcServer: ReturnType<typeof Bun.serve> | null = null;
 
   constructor(
     private readonly config: WebConfig,
     private readonly view: WebDaemonView,
+    /** When set, all /api/* HTTP requests require Authorization: Bearer <token>. */
+    private readonly authToken?: string,
   ) {}
 
   start(): void {
@@ -94,15 +99,34 @@ export class WebServer {
     console.log(`[web] listening on http://${this.config.host}:${this.config.port}`);
   }
 
+  /** Start a Unix domain socket IPC server for plugin scripts (no auth). */
+  async startIpc(sockPath: string): Promise<void> {
+    if (this.ipcServer) return;
+    try { await unlink(sockPath); } catch {}
+    this.ipcServer = Bun.serve({
+      unix: sockPath,
+      fetch: (req) => this.handleApi(req),
+    });
+    console.log(`[web] IPC socket at ${sockPath}`);
+  }
+
   stop(): void {
     this.server?.stop();
     this.server = null;
+    this.ipcServer?.stop();
+    this.ipcServer = null;
   }
 
   private async handle(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
     try {
+      if (path.startsWith("/api/") && this.authToken) {
+        const authHeader = req.headers.get("authorization") ?? "";
+        if (authHeader !== `Bearer ${this.authToken}`) {
+          return this.json({ error: "unauthorized" }, 401);
+        }
+      }
       if (req.method === "GET" && path === "/") return this.html(await this.renderHome());
       if (req.method === "GET" && path === "/jobs") return this.html(await this.renderJobs());
       if (req.method === "GET" && path === "/jobs/new") return this.html(this.renderJobForm(null, ""));
@@ -132,6 +156,19 @@ export class WebServer {
         return this.html(await this.renderTranscript(key, limit));
       }
 
+      return this.handleApi(req);
+    } catch (err) {
+      console.error("[web] handler error:", err);
+      return this.json({ error: (err as Error).message }, 500);
+    }
+  }
+
+  /** Handle API routes — called directly by the IPC server (no auth) and
+   *  via handle() for the HTTP server (after auth check). */
+  private async handleApi(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    const path = url.pathname;
+    try {
       if (req.method === "GET" && path === "/api/status") {
         return this.json({
           running: true,
@@ -155,10 +192,6 @@ export class WebServer {
         if (!body || typeof body.target !== "string" || typeof body.text !== "string") {
           return this.json({ error: "expected { target, text, fromLabel? }" }, 400);
         }
-        // 1. Deliver the message to the actual platform (Telegram/Discord/…).
-        // 2. Record an inbox echo on the channel that owns inbound traffic
-        //    from this target, so its session sees "you sent this earlier"
-        //    next time it's triggered.
         const dispatch = await this.view.sendToPlatform(body.target, body.text);
         if (!dispatch.ok) {
           return this.json({ error: dispatch.error ?? "send failed", target: body.target }, 400);
@@ -172,11 +205,7 @@ export class WebServer {
             note: `to=${body.target}`,
           });
         }
-        return this.json({
-          ok: true,
-          target: body.target,
-          inboxOwner: ownerKey,
-        });
+        return this.json({ ok: true, target: body.target, inboxOwner: ownerKey });
       }
       if (req.method === "POST" && path === "/api/trigger") {
         const body: any = await req.json().catch(() => null);
@@ -185,10 +214,6 @@ export class WebServer {
         }
         const channel = await this.view.resolveChannel(body.target);
         if (!channel) return this.json({ error: `target "${body.target}" not resolvable` }, 404);
-        // If the caller didn't pin a return address, derive one from the
-        // target key when the target is bound to a single platform/channel.
-        // Without this, /api/trigger discord:<id> would run the agent but
-        // its reply would only land in the daemon log.
         const replyTo = parseReplyTo(body.replyTo) ?? deriveReplyToFromTarget(body.target);
         await channel.handleIncoming({
           text: body.prompt,
@@ -197,9 +222,15 @@ export class WebServer {
         });
         return this.json({ ok: true, dispatched: true, target: body.target });
       }
+      if (req.method === "POST" && path === "/api/restart") {
+        const restart = this.view.restartDaemon;
+        if (!restart) return this.json({ error: "restart not supported" }, 501);
+        setTimeout(() => restart(), 100);
+        return this.json({ ok: true, restarting: true });
+      }
       return this.json({ error: "not found" }, 404);
     } catch (err) {
-      console.error("[web] handler error:", err);
+      console.error("[web] api error:", err);
       return this.json({ error: (err as Error).message }, 500);
     }
   }

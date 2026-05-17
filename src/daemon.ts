@@ -74,6 +74,7 @@ class Daemon {
   private startedAt = Date.now();
   private shuttingDown = false;
   private slashCommands: SlashCommandDef[] = [];
+  private authToken: string | undefined;
 
   constructor(private settings: Settings) {}
 
@@ -89,7 +90,7 @@ class Daemon {
     this.startCron();
     this.startHeartbeat();
     this.startStatusline();
-    this.startWeb();
+    await this.startWeb();
     this.startSessionCleanup();
     this.watchSettings();
     this.installSignalHandlers();
@@ -184,7 +185,8 @@ class Daemon {
     console.log(`[daemon] reload done`);
   }
 
-  private startWeb(): void {
+  private async startWeb(): Promise<void> {
+    this.authToken = await this.loadOrCreateAuthToken();
     const view: WebDaemonView = {
       projectDir: this.projectDir,
       startedAt: this.startedAt,
@@ -200,9 +202,28 @@ class Daemon {
       triggerJob: (name) => this.triggerJobByName(name),
       sendToPlatform: (target, text) => this.sendToPlatform(target, text),
       inboxOwnerForTarget: (target) => inboxOwnerForTarget(target),
+      restartDaemon: () => {
+        console.log("[daemon] restart requested via API");
+        setTimeout(() => this.shutdown("api-restart", 75), 100);
+      },
     };
-    this.web = new WebServer(this.settings.web, view);
+    this.web = new WebServer(this.settings.web, view, this.authToken);
     this.web.start();
+    const sockPath = join(this.projectDir, ".claude", "claudeclaw", "daemon.sock");
+    await this.web.startIpc(sockPath);
+  }
+
+  private async loadOrCreateAuthToken(): Promise<string> {
+    const tokenPath = join(this.projectDir, ".claude", "claudeclaw", "auth.token");
+    try {
+      const existing = await Bun.file(tokenPath).text();
+      const trimmed = existing.trim();
+      if (trimmed.length >= 32) return trimmed;
+    } catch {}
+    const token = randomBytes(32).toString("hex");
+    await writeFile(tokenPath, token, { mode: 0o600 });
+    console.log(`[web] generated auth token → ${tokenPath}`);
+    return token;
   }
 
   private snapshotChannels(): SessionView[] {
@@ -1409,7 +1430,7 @@ class Daemon {
     process.on("SIGHUP", () => void this.reloadSettings("SIGHUP"));
   }
 
-  async shutdown(reason: string): Promise<void> {
+  async shutdown(reason: string, exitCode = 0): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
     console.log(`[daemon] shutting down (${reason})...`);
@@ -1432,7 +1453,7 @@ class Daemon {
         channel["tailer"]?.stop?.();
       } catch {}
     }
-    process.exit(0);
+    process.exit(exitCode);
   }
 }
 
