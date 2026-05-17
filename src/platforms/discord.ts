@@ -33,6 +33,7 @@ const INTENTS = INTENT_GUILDS | INTENT_GUILD_MESSAGES | INTENT_DIRECT_MESSAGES |
 const OP_DISPATCH = 0;
 const OP_HEARTBEAT = 1;
 const OP_IDENTIFY = 2;
+const OP_RESUME = 6;
 const OP_RECONNECT = 7;
 const OP_INVALID_SESSION = 9;
 const OP_HELLO = 10;
@@ -80,6 +81,10 @@ export class DiscordPlatform implements DiscordSender {
   private heartbeatIntervalMs = 0;
   private lastSeq: number | null = null;
   private botUserId: string | null = null;
+  private sessionId: string | null = null;
+  private resumeGatewayUrl: string | null = null;
+  /** True when the next connect() should attempt RESUME instead of IDENTIFY. */
+  private resumeOnConnect = false;
   private running = false;
   private reconnectDelay = 1000;
   private pendingSlashCommands: Array<{ name: string; description: string }> | null = null;
@@ -109,8 +114,12 @@ export class DiscordPlatform implements DiscordSender {
 
   private connect(): void {
     if (!this.running) return;
+    const url =
+      this.resumeOnConnect && this.resumeGatewayUrl
+        ? `${this.resumeGatewayUrl}?v=10&encoding=json`
+        : GATEWAY_URL;
     console.log("[discord] connecting to gateway…");
-    const ws = new WebSocket(GATEWAY_URL);
+    const ws = new WebSocket(url);
     this.ws = ws;
     ws.addEventListener("open", () => {
       console.log("[discord] gateway connected");
@@ -129,7 +138,7 @@ export class DiscordPlatform implements DiscordSender {
       console.warn(`[discord] gateway closed (${event.code}): ${event.reason || "no reason"}`);
       this.cleanupHeartbeat();
       this.ws = null;
-      this.lastSeq = null;
+      if (!this.resumeOnConnect) this.lastSeq = null;
       if (!this.running) return;
       // Fatal codes that mean "stop forever" per Discord docs.
       const fatal = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
@@ -153,19 +162,33 @@ export class DiscordPlatform implements DiscordSender {
     if (op === OP_HELLO) {
       this.heartbeatIntervalMs = d?.heartbeat_interval ?? 41_250;
       this.startHeartbeat();
-      this.sendIdentify();
+      if (this.resumeOnConnect && this.sessionId && this.lastSeq !== null) {
+        this.sendResume();
+        this.resumeOnConnect = false;
+      } else {
+        this.sendIdentify();
+      }
     } else if (op === OP_HEARTBEAT) {
       this.sendHeartbeat();
     } else if (op === OP_HEARTBEAT_ACK) {
       // ok
     } else if (op === OP_RECONNECT) {
       console.warn("[discord] gateway asked us to reconnect");
+      this.resumeOnConnect = true;
       try {
         this.ws?.close(4000, "reconnect requested");
       } catch {}
     } else if (op === OP_INVALID_SESSION) {
-      console.warn("[discord] invalid session — re-identifying after delay");
-      setTimeout(() => this.sendIdentify(), 2000);
+      if (d === false) {
+        console.warn("[discord] invalid session (non-resumable) — re-identifying");
+        this.sessionId = null;
+        this.lastSeq = null;
+        this.resumeOnConnect = false;
+        setTimeout(() => this.sendIdentify(), 2000);
+      } else {
+        console.warn("[discord] invalid session (resumable) — retrying RESUME");
+        setTimeout(() => this.sendResume(), 2000);
+      }
     } else if (op === OP_DISPATCH) {
       this.reconnectDelay = 1000; // healthy traffic → reset backoff
       await this.handleDispatch(t, d);
@@ -204,6 +227,19 @@ export class DiscordPlatform implements DiscordSender {
     });
   }
 
+  private sendResume(): void {
+    if (!this.sessionId || this.lastSeq === null) {
+      console.warn("[discord] sendResume called but no session/seq — falling back to identify");
+      this.sendIdentify();
+      return;
+    }
+    this.sendOp(OP_RESUME, {
+      token: this.opts.config.token,
+      session_id: this.sessionId,
+      seq: this.lastSeq,
+    });
+  }
+
   private sendOp(op: number, d: unknown): void {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -217,11 +253,19 @@ export class DiscordPlatform implements DiscordSender {
   private async handleDispatch(t: string, d: any): Promise<void> {
     if (t === "READY") {
       this.botUserId = d?.user?.id ?? null;
+      this.sessionId = d?.session_id ?? null;
+      this.resumeGatewayUrl = d?.resume_gateway_url ?? null;
+      this.resumeOnConnect = false;
       console.log(`[discord] READY as ${d?.user?.username} (${this.botUserId})`);
       if (this.pendingSlashCommands) {
         void this.doRegisterGlobalCommands(this.pendingSlashCommands);
         this.pendingSlashCommands = null;
       }
+      return;
+    }
+    if (t === "RESUMED") {
+      this.reconnectDelay = 1000;
+      console.log("[discord] session resumed successfully");
       return;
     }
     if (t === "MESSAGE_CREATE") {
