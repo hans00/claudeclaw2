@@ -8,6 +8,7 @@
  *
  * Emits outbound events via callbacks; platform connectors implement them.
  */
+import { mkdir, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
 import type { AgenticConfig } from "./config";
@@ -98,6 +99,13 @@ const TYPING_PULSE_MS = 4000;
 /** Synthesise turn-end this long after a passthrough slash command if no
  *  jsonl event came in — covers UI-only commands like `/reload-plugins`. */
 const SLASH_IDLE_TIMEOUT_MS = 2000;
+
+/** How long with no jsonl activity before the stall watchdog fires. */
+const STALL_TIMEOUT_MS = 120_000;
+/** Absolute maximum stall time before forcing recovery regardless of pane state. */
+const STALL_MAX_MS = 600_000;
+/** How long to wait for the /model echo before giving up and proceeding. */
+const MODEL_ECHO_TIMEOUT_MS = 3_000;
 
 export interface SourceInfo {
   platform: "telegram" | "discord" | "slack" | "line";
@@ -256,6 +264,10 @@ export class Channel {
   private interruptTimer: ReturnType<typeof setTimeout> | null = null;
   private typingTimer: ReturnType<typeof setInterval> | null = null;
   private approvalTimer: ReturnType<typeof setInterval> | null = null;
+  private stallTimer: ReturnType<typeof setTimeout> | null = null;
+  private stallStartTime: number | null = null;
+  /** Resolved by onJsonlEvent when the /model echo arrives. */
+  private modelEchoResolve: (() => void) | null = null;
   /**
    * Fallback timer for passthrough slash commands. Some Claude Code slash
    * commands (`/reload-plugins`, `/help`, `/clear`, …) are UI-only and never
@@ -376,6 +388,8 @@ export class Channel {
       // cancel the UI-only-slash fallback so its normal handler (classifier
       // path or end_turn) takes care of the turn-end.
       this.clearSlashIdleTimer();
+      // Any activity resets the stall watchdog.
+      this.resetStallTimer();
 
       // Auto-wake detection: if we receive a fresh assistant event while
       // the channel is idle, the agent has triggered itself (ScheduleWakeup,
@@ -426,6 +440,7 @@ export class Channel {
             // when the user typed /model themselves and nothing else follows.
             if (this.expectingModelEcho) {
               this.expectingModelEcho = false;
+              this.modelEchoResolve?.();
             } else {
               this.onTurnEnd();
             }
@@ -529,6 +544,7 @@ export class Channel {
       this.interruptTimer = null;
     }
     this.clearSlashIdleTimer();
+    this.clearStallTimer();
     this.stopTypingPulse();
     this.stopApprovalPoll();
     this.state = "idle";
@@ -558,6 +574,87 @@ export class Channel {
     if (this.slashIdleTimer) {
       clearTimeout(this.slashIdleTimer);
       this.slashIdleTimer = null;
+    }
+  }
+
+  private armStallTimer(): void {
+    this.clearStallTimer();
+    this.stallStartTime = Date.now();
+    this.stallTimer = setTimeout(() => void this.onStall(), STALL_TIMEOUT_MS);
+  }
+
+  private resetStallTimer(): void {
+    if (!this.stallTimer) return; // not armed — only reset when running
+    clearTimeout(this.stallTimer);
+    this.stallTimer = setTimeout(() => void this.onStall(), STALL_TIMEOUT_MS);
+  }
+
+  private clearStallTimer(): void {
+    if (this.stallTimer) {
+      clearTimeout(this.stallTimer);
+      this.stallTimer = null;
+    }
+    this.stallStartTime = null;
+  }
+
+  private async onStall(): Promise<void> {
+    this.stallTimer = null;
+    if (this.state !== "running" && this.state !== "interrupting") return;
+
+    const key = this.opts.session.channelKey;
+    const stallMs = this.stallStartTime ? Date.now() - this.stallStartTime : STALL_TIMEOUT_MS;
+    const forceRecover = stallMs >= STALL_MAX_MS;
+
+    let pane = "(capture failed)";
+    try {
+      pane = await capturePane(this.opts.session.tmuxSession);
+    } catch {}
+
+    await this.writeStallDiagnosis(pane, stallMs);
+
+    const atPrompt = /❯\s*$/.test(pane.trimEnd()) || />\s*$/.test(pane.trimEnd());
+
+    if (atPrompt || forceRecover) {
+      console.warn(
+        `[channel ${key}] stall: no jsonl activity for ${Math.round(stallMs / 1000)}s` +
+          (forceRecover && !atPrompt ? " (max exceeded, forcing recovery)" : " — claude at prompt, recovering"),
+      );
+      this.onTurnEnd();
+    } else {
+      console.warn(
+        `[channel ${key}] stall: no jsonl activity for ${Math.round(stallMs / 1000)}s — pane not at prompt, re-checking in 30s`,
+      );
+      this.stallTimer = setTimeout(() => void this.onStall(), 30_000);
+    }
+  }
+
+  private async writeStallDiagnosis(pane: string, stallMs: number): Promise<void> {
+    const key = this.opts.session.channelKey;
+    const now = new Date();
+    const stamp = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const safeKey = key.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const logDir = join(this.opts.projectDir, ".claude", "claudeclaw", "logs");
+    const path = join(logDir, `stall-${safeKey}-${stamp}.txt`);
+    const queueSnippet = this.queue
+      .map((q, i) => `  [${i}] ${q.text.slice(0, 120)}`)
+      .join("\n");
+    const report = [
+      `stall diagnosis — ${now.toISOString()}`,
+      `channel: ${key}`,
+      `state:   ${this.state}`,
+      `stall:   ${Math.round(stallMs / 1000)}s`,
+      `queue:   ${this.queue.length} item(s)`,
+      queueSnippet || "  (empty)",
+      "",
+      "--- tmux pane ---",
+      pane,
+    ].join("\n");
+    try {
+      await mkdir(logDir, { recursive: true });
+      await writeFile(path, report, "utf8");
+      console.log(`[channel ${key}] stall: diagnosis written to ${path}`);
+    } catch (err) {
+      console.error(`[channel ${key}] stall: failed to write diagnosis:`, err);
     }
   }
 
@@ -633,6 +730,7 @@ export class Channel {
     if (isPassthroughSlashCommand(item.text)) {
       this.startTypingPulse();
       this.startApprovalPoll();
+      this.armStallTimer();
       this.armSlashIdleTimer();
       try {
         await pasteText(target, item.text.trim());
@@ -641,6 +739,7 @@ export class Channel {
       } catch (err) {
         console.error(`[channel ${this.opts.session.channelKey}] slash paste failed:`, err);
         this.opts.callbacks.onError?.(err as Error);
+        this.clearStallTimer();
         this.stopTypingPulse();
         this.clearSlashIdleTimer();
         this.state = "idle";
@@ -654,6 +753,7 @@ export class Channel {
 
     this.startTypingPulse();
     this.startApprovalPoll();
+    this.armStallTimer();
     try {
       await this.maybeSwitchModel(item.text);
       await pasteText(target, full);
@@ -662,6 +762,7 @@ export class Channel {
     } catch (err) {
       console.error(`[channel ${this.opts.session.channelKey}] paste failed:`, err);
       this.opts.callbacks.onError?.(err as Error);
+      this.clearStallTimer();
       this.stopTypingPulse();
       this.state = "idle";
     }
@@ -706,16 +807,23 @@ export class Channel {
       // Mark the next "Set model to …" jsonl echo as ours so it doesn't
       // get treated as a turn boundary or forwarded to the platform.
       this.expectingModelEcho = true;
+      const echoReady = new Promise<void>((r) => {
+        this.modelEchoResolve = r;
+      });
       await sendKeys(target, `/model ${routed.model}`);
       await new Promise((r) => setTimeout(r, 150));
       await pressEnter(target);
-      // /model is client-side and fast, but the TUI needs time to clear the
-      // input box and become ready for the next paste — short waits caused a
-      // race where pressEnter for the user prompt landed on an empty input.
-      await new Promise((r) => setTimeout(r, 700));
+      // Wait for the tool-call response (the "Set model to …" stdout event)
+      // to land in the jsonl before pasting the user prompt. Falls back to a
+      // hard timeout so a missed echo doesn't deadlock the channel.
+      await Promise.race([echoReady, new Promise((r) => setTimeout(r, MODEL_ECHO_TIMEOUT_MS))]);
+      this.modelEchoResolve = null;
+      // Give the TUI a moment to clear the input box after the echo.
+      await new Promise((r) => setTimeout(r, 300));
       this.currentModel = routed.model;
     } catch (err) {
       this.expectingModelEcho = false;
+      this.modelEchoResolve = null;
       console.error(`[channel ${this.opts.session.channelKey}] /model send failed:`, err);
     }
   }
@@ -737,6 +845,7 @@ export class Channel {
     if (this.interruptTimer) clearTimeout(this.interruptTimer);
     this.interruptTimer = null;
     this.clearSlashIdleTimer();
+    this.clearStallTimer();
     this.stopTypingPulse();
     this.stopApprovalPoll();
     try {
