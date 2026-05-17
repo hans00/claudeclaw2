@@ -32,10 +32,34 @@ async function parseDescription(filePath: string): Promise<string> {
   return "";
 }
 
+/**
+ * Daemon-native commands handled locally (never forwarded to tmux).
+ * Listed first so they appear at the top of the help / platform menus.
+ */
+const DAEMON_COMMANDS: SlashCommandDef[] = [
+  { name: "help",   originalName: "help",   description: "Show available commands" },
+  { name: "stop",   originalName: "stop",   description: "Stop the current running turn and clear the queue" },
+  { name: "status", originalName: "status", description: "Show daemon status and current channel state" },
+];
+
+/**
+ * Claude Code built-in passthrough commands worth surfacing in platform menus.
+ * Multi-word commands use _ as separator; daemon maps them back before forwarding.
+ */
+const BUILTIN_COMMANDS: SlashCommandDef[] = [
+  { name: "clear",          originalName: "clear",          description: "Clear the conversation history" },
+  { name: "compact",        originalName: "compact",        description: "Compact conversation context" },
+  { name: "context",        originalName: "context",        description: "Show current context window usage" },
+  { name: "cost",           originalName: "cost",           description: "Show token usage and cost for this session" },
+  { name: "reset",          originalName: "reset",          description: "Reset to a fresh conversation" },
+  { name: "doctor",         originalName: "doctor",         description: "Check Claude Code setup and configuration" },
+  { name: "plugin_reload",  originalName: "plugin reload",  description: "Reload all plugins without restarting" },
+];
+
 export async function discoverCommands(): Promise<SlashCommandDef[]> {
   const pluginsCacheDir = join(homedir(), ".claude", "plugins", "cache");
-  const commands: SlashCommandDef[] = [];
-  const seen = new Set<string>();
+  const commands: SlashCommandDef[] = [...DAEMON_COMMANDS, ...BUILTIN_COMMANDS];
+  const seen = new Set<string>(commands.map((c) => c.name));
 
   function add(originalName: string, description: string): void {
     if (!description) return;

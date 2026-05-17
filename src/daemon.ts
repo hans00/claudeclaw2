@@ -542,7 +542,7 @@ class Daemon {
     if (!channel) return;
     await touchActivity(key);
     if (await this.tryHandleCommand(msg.text, channel, replyTo)) return;
-    const text = composePromptWithAttachments(msg.text, msg.attachments);
+    const text = composePromptWithAttachments(this.resolveCommandText(msg.text), msg.attachments);
     const source: SourceInfo = {
       platform: "line",
       name: msg.fromName,
@@ -592,7 +592,7 @@ class Daemon {
     if (!channel) return;
     await touchActivity(key);
     if (await this.tryHandleCommand(msg.text, channel, replyTo)) return;
-    const text = composePromptWithAttachments(msg.text, msg.attachments);
+    const text = composePromptWithAttachments(this.resolveCommandText(msg.text), msg.attachments);
     await channel.handleIncoming({
       text,
       fromLabel: msg.fromName,
@@ -615,7 +615,7 @@ class Daemon {
     if (!channel) return;
     await touchActivity(key);
     if (await this.tryHandleCommand(msg.text, channel, replyTo)) return;
-    const text = composePromptWithAttachments(msg.text, msg.attachments);
+    const text = composePromptWithAttachments(this.resolveCommandText(msg.text), msg.attachments);
     const source: SourceInfo = {
       platform: "discord",
       name: msg.fromName,
@@ -651,7 +651,7 @@ class Daemon {
     if (!channel) return;
     await touchActivity(key);
     if (await this.tryHandleCommand(msg.text, channel, replyTo)) return;
-    const text = composePromptWithAttachments(msg.text, msg.attachments);
+    const text = composePromptWithAttachments(this.resolveCommandText(msg.text), msg.attachments);
     const source: SourceInfo = {
       platform: "telegram",
       name: msg.fromName,
@@ -679,6 +679,16 @@ class Daemon {
    * Skill commands and other model-bound slash commands DO write jsonl when
    * they fire, so they pass through unchanged.
    */
+  /** Translate platform-normalized command names back to original form.
+   *  e.g. "/plugin_reload" → "/plugin reload". No-op for unknown or non-slash text. */
+  private resolveCommandText(raw: string): string {
+    const m = raw.trim().match(/^\/([a-z0-9_]+)(\s.*)?$/i);
+    if (!m) return raw;
+    const candidate = this.slashCommands.find((c) => c.name === m[1] && c.originalName !== m[1]);
+    if (!candidate) return raw;
+    return `/${candidate.originalName}${m[2] ?? ""}`;
+  }
+
   private async tryHandleCommand(
     raw: string,
     channel: Channel,
