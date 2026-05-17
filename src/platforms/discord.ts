@@ -82,6 +82,7 @@ export class DiscordPlatform implements DiscordSender {
   private botUserId: string | null = null;
   private running = false;
   private reconnectDelay = 1000;
+  private pendingSlashCommands: Array<{ name: string; description: string }> | null = null;
 
   constructor(private readonly opts: DiscordOptions) {}
 
@@ -217,6 +218,10 @@ export class DiscordPlatform implements DiscordSender {
     if (t === "READY") {
       this.botUserId = d?.user?.id ?? null;
       console.log(`[discord] READY as ${d?.user?.username} (${this.botUserId})`);
+      if (this.pendingSlashCommands) {
+        void this.doRegisterGlobalCommands(this.pendingSlashCommands);
+        this.pendingSlashCommands = null;
+      }
       return;
     }
     if (t === "MESSAGE_CREATE") {
@@ -382,6 +387,33 @@ export class DiscordPlatform implements DiscordSender {
     if (!res.ok && res.status !== 204) {
       const body = await res.text().catch(() => "");
       console.error(`[discord] addReaction ${res.status}: ${body.slice(0, 200)}`);
+    }
+  }
+
+  /** Register (or overwrite) global application slash commands.
+   *  Safe to call before READY — queued and replayed on connect. */
+  async registerGlobalCommands(commands: Array<{ name: string; description: string }>): Promise<void> {
+    if (!this.opts.config.token) return;
+    if (this.botUserId) {
+      void this.doRegisterGlobalCommands(commands);
+    } else {
+      this.pendingSlashCommands = commands;
+    }
+  }
+
+  private async doRegisterGlobalCommands(commands: Array<{ name: string; description: string }>): Promise<void> {
+    if (!this.botUserId) return;
+    const body = commands.map((c) => ({ name: c.name, description: c.description || "-", type: 1 }));
+    try {
+      const res = await this.rest("PUT", `/applications/${this.botUserId}/commands`, body);
+      if (res.ok) {
+        console.log(`[discord] registered ${commands.length} global slash command(s)`);
+      } else {
+        const detail = await res.text().catch(() => "");
+        console.error(`[discord] slash command registration failed ${res.status}: ${detail}`);
+      }
+    } catch (err) {
+      console.error("[discord] slash command registration error:", err);
     }
   }
 

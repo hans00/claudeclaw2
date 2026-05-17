@@ -312,6 +312,29 @@ export class TelegramPlatform implements TelegramSender {
     return false;
   }
 
+  /** Register bot commands visible in the Telegram menu (the / autocomplete). */
+  async setCommands(commands: Array<{ name: string; description: string }>): Promise<void> {
+    const token = this.opts.config.token;
+    if (!token) return;
+    try {
+      const res = await fetch(`${API_BASE}/bot${token}/setMyCommands`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          commands: commands.map((c) => ({ command: c.name, description: c.description || "-" })),
+        }),
+      });
+      if (res.ok) {
+        console.log(`[telegram] registered ${commands.length} command(s)`);
+      } else {
+        const detail = await res.text().catch(() => "");
+        console.error(`[telegram] setMyCommands failed ${res.status}: ${detail}`);
+      }
+    } catch (err) {
+      console.error("[telegram] setMyCommands error:", err);
+    }
+  }
+
   async sendTypingAction(chatId: number): Promise<void> {
     const token = this.opts.config.token;
     if (!token) return;

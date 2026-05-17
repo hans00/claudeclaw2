@@ -8,6 +8,7 @@
 import { randomUUID } from "crypto";
 import { watch } from "fs";
 import { mkdir, unlink, writeFile } from "fs/promises";
+import { discoverCommands, type SlashCommandDef } from "./slash-commands";
 import { dirname, join } from "path";
 import { Channel, type ChannelCallbacks, type ReplyTarget } from "./channel";
 import { loadSettings, type MessageStreamMode, type Settings } from "./config";
@@ -72,6 +73,7 @@ class Daemon {
   private projectDir = process.cwd();
   private startedAt = Date.now();
   private shuttingDown = false;
+  private slashCommands: SlashCommandDef[] = [];
 
   constructor(private settings: Settings) {}
 
@@ -92,6 +94,8 @@ class Daemon {
     this.watchSettings();
     this.installSignalHandlers();
     console.log(`[daemon] ready (project=${this.projectDir})`);
+    // Discover plugin slash commands and push to platforms (non-blocking).
+    void this.syncPlatformCommands();
   }
 
   /**
@@ -464,6 +468,21 @@ class Daemon {
     if (dirty) await saveSessions(persisted);
   }
 
+  private async syncPlatformCommands(): Promise<void> {
+    try {
+      this.slashCommands = await discoverCommands();
+      if (this.slashCommands.length === 0) return;
+      console.log(`[daemon] discovered ${this.slashCommands.length} slash command(s)`);
+      const payload = this.slashCommands.map((c) => ({ name: c.name, description: c.description }));
+      await Promise.all([
+        this.telegram?.setCommands(payload),
+        this.discord?.registerGlobalCommands(payload),
+      ]);
+    } catch (err) {
+      console.error("[daemon] syncPlatformCommands error:", err);
+    }
+  }
+
   private async startTelegram(): Promise<void> {
     if (!this.settings.telegram.token) {
       console.log("[daemon] telegram disabled (no token)");
@@ -666,6 +685,15 @@ class Daemon {
     replyTo: ReplyTarget,
   ): Promise<boolean> {
     const cmd = raw.trim();
+    if (cmd === "/help") {
+      const lines = ["Available commands:"];
+      for (const c of this.slashCommands) {
+        lines.push(`/${c.originalName} — ${c.description}`);
+      }
+      if (lines.length === 1) lines.push("(no plugin commands discovered yet)");
+      await this.dispatchOutbound(channel.session, lines.join("\n"), replyTo);
+      return true;
+    }
     if (cmd === "/stop") {
       const state = channel.currentState;
       await channel.userStop();
