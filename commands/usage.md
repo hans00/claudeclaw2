@@ -41,9 +41,12 @@ def reset_str(ts):
         t = float(ts)
         if t < now: return "expired (reset occurred)"
         diff = int(t - now)
-        h, rem = divmod(diff, 3600)
+        d, rem = divmod(diff, 86400)
+        h, rem = divmod(rem, 3600)
         m = rem // 60
-        return f"{h}h {m}m" if h else f"{m}m"
+        if d: return f"{d}d {h}h {m}m"
+        if h: return f"{h}h {m}m"
+        return f"{m}m"
     except: return "unknown"
 
 five_pct = pct(five.get("used_percentage"))

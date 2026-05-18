@@ -872,9 +872,12 @@ class Daemon {
       const t = parseFloat(String(ts));
       if (isNaN(t) || t < now) return "reset occurred";
       const diff = Math.round(t - now);
-      const h = Math.floor(diff / 3600);
+      const d = Math.floor(diff / 86400);
+      const h = Math.floor((diff % 86400) / 3600);
       const m = Math.floor((diff % 3600) / 60);
-      return h ? `${h}h ${m}m` : `${m}m`;
+      if (d) return `${d}d ${h}h ${m}m`;
+      if (h) return `${h}h ${m}m`;
+      return `${m}m`;
     }
 
     function bar(p: number | null): string {
