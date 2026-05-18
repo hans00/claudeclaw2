@@ -7,9 +7,10 @@
  */
 import { randomUUID } from "crypto";
 import { watch } from "fs";
-import { mkdir, unlink, writeFile } from "fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "fs/promises";
 import { discoverCommands, type SlashCommandDef } from "./slash-commands";
 import { dirname, join } from "path";
+import { homedir } from "os";
 import { Channel, type ChannelCallbacks, type ReplyTarget } from "./channel";
 import { loadSettings, type MessageStreamMode, type Settings } from "./config";
 import { CronScheduler, loadJob, type Job } from "./jobs";
@@ -780,6 +781,11 @@ class Daemon {
       await this.dispatchOutbound(channel.session, msg, replyTo);
       return true;
     }
+    if (cmd === "/usage") {
+      const msg = await this.summarizeUsage();
+      await this.dispatchOutbound(channel.session, msg, replyTo);
+      return true;
+    }
     return false;
   }
 
@@ -812,6 +818,85 @@ class Daemon {
       `  state   ${channel.currentState}`,
       `  session ${s.sessionId.slice(0, 8)}`,
     ].join("\n");
+  }
+
+  private async summarizeUsage(): Promise<string> {
+    const STATUS_FILE = join(homedir(), ".claude", "usag-status.json");
+    let raw: string;
+    try {
+      raw = await readFile(STATUS_FILE, "utf8");
+    } catch {
+      return [
+        "📊 Claude Code Usage",
+        "",
+        "No data yet — the statusLine hook needs to fire at least once.",
+        "Run any command in a Claude Code session to trigger it.",
+      ].join("\n");
+    }
+
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return "⚠ usage data file is corrupt";
+    }
+
+    const now = Date.now() / 1000;
+    const receivedTs = typeof data._received_at_ts === "number" ? data._received_at_ts : 0;
+    const ageMin = receivedTs ? Math.round((now - receivedTs) / 60) : null;
+
+    const rl = (data.rate_limits ?? {}) as Record<string, unknown>;
+    const five = (rl.five_hour ?? {}) as Record<string, unknown>;
+    const seven = (rl.seven_day ?? {}) as Record<string, unknown>;
+
+    function pct(v: unknown): number | null {
+      if (v == null) return null;
+      const n = parseFloat(String(v));
+      return isNaN(n) ? null : Math.max(0, Math.min(100, Math.round(n)));
+    }
+
+    function resetIn(ts: unknown): string {
+      if (!ts) return "unknown";
+      const t = parseFloat(String(ts));
+      if (isNaN(t) || t < now) return "reset occurred";
+      const diff = Math.round(t - now);
+      const h = Math.floor(diff / 3600);
+      const m = Math.floor((diff % 3600) / 60);
+      return h ? `${h}h ${m}m` : `${m}m`;
+    }
+
+    function bar(p: number | null): string {
+      if (p === null) return "[no data]";
+      const filled = Math.round(p / 100 * 15);
+      const icon = p >= 90 ? "🔴" : p >= 70 ? "🟡" : "🟢";
+      return `${"█".repeat(filled)}${"░".repeat(15 - filled)} ${p}% ${icon}`;
+    }
+
+    const fivePct = pct(five.used_percentage);
+    const sevenPct = pct(seven.used_percentage);
+    const fiveReset = five.resets_at;
+    const sevenReset = seven.resets_at;
+
+    const lines: string[] = [
+      "📊 Claude Code Usage",
+      "",
+      `5h window  ${bar(fivePct)}`,
+      `           resets in ${resetIn(fiveReset)}`,
+      "",
+      `7d weekly  ${bar(sevenPct)}`,
+      `           resets in ${resetIn(sevenReset)}`,
+    ];
+
+    if (typeof data.cost === "number") {
+      lines.push("", `session cost  $${data.cost.toFixed(4)}`);
+    }
+
+    if (ageMin !== null) {
+      const staleTag = ageMin > 360 ? ` ⚠ stale` : "";
+      lines.push("", `data from ${ageMin}m ago${staleTag}`);
+    }
+
+    return lines.join("\n");
   }
 
   private async ensureChannel(
