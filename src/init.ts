@@ -63,6 +63,9 @@ const SETTINGS_TEMPLATE = `{
     "botToken": "",
     "allowedUserIds": [],
     "allowedBotIds": [],
+    "//": "defaultMode: 'channel' (one session per channel, like Discord) | 'thread-per-message' (each top-level message starts its own session — pair with a short sessionCleanup.idleTimeoutHours). Per-channel overrides go in channels.<id>.mode",
+    "defaultMode": "channel",
+    "channels": {},
     "messageStream": { "mode": "replace" }
   },
   "line": {

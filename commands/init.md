@@ -77,6 +77,16 @@ Walk the user through a fresh ClaudeClaw v2 install. Follow these steps in order
 - Subscribe to events: `message.channels`, `message.im`, `message.groups`.
 - Edit `slack.appToken`, `slack.botToken`, `slack.allowedUserIds`.
 
+**Ask which channel-routing mode they want** (`slack.defaultMode`, or per channel under `slack.channels.<id>.mode`):
+
+  - `channel` (default) — every message in a channel (including thread replies) shares one session. Behaves like Discord. Good for casual / personal channels where the whole conversation history is one context.
+
+  - `thread-per-message` — every top-level message in the channel starts its own session; thread replies join that thread's session. Matches a typical office workflow where each thread is a self-contained task or topic.
+
+If they pick `thread-per-message`, **strongly recommend** dropping `sessionCleanup.idleTimeoutHours` from the default 168h (7 days) to something short like `2`–`8` hours. Each top-level message spawns a new tmux session; without aggressive cleanup, busy channels will leave dozens of dead sessions sitting around.
+
+Note: idle-cleaned sessions auto-restore via `claude --resume` on the next inbound message in the same channel/thread — the `sessions.json` entry persists across cleanup, so context isn't lost.
+
 ### LINE (if chosen)
 - Tell them they need a publicly reachable HTTPS endpoint. Easiest:
   ```bash

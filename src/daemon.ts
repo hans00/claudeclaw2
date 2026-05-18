@@ -634,14 +634,26 @@ class Daemon {
 
   private async routeSlack(msg: SlackInbound): Promise<void> {
     const isDM = msg.channelType === "im";
-    // v1 parity: messages in a thread get their own session.
+    // Channel-routing modes (see SlackChannelMode in config.ts):
+    //   "channel"            — every message in the channel (incl. thread replies)
+    //                          → one shared session `slack:<channelId>`
+    //   "thread-per-message" — each top-level message starts its own session;
+    //                          replies in that thread join it via thread_ts.
     let key: string;
-    if (isDM) key = GLOBAL_KEY;
-    else if (msg.threadTs && msg.threadTs !== msg.messageTs) {
-      // thread_ts == message_ts on the parent message — that's "starting" the
-      // thread but isn't itself a thread reply yet. Keep parent on the channel.
-      key = `slack:${msg.channelId}:${msg.threadTs}`;
-    } else key = `slack:${msg.channelId}`;
+    if (isDM) {
+      key = GLOBAL_KEY;
+    } else {
+      const channelCfg = this.settings.slack.channels?.[msg.channelId];
+      const mode = channelCfg?.mode ?? this.settings.slack.defaultMode ?? "channel";
+      if (mode === "thread-per-message") {
+        // thread_ts is set on replies; the parent message has no thread_ts
+        // until someone replies, so it anchors on its own messageTs.
+        const anchor = msg.threadTs ?? msg.messageTs;
+        key = `slack:${msg.channelId}:${anchor}`;
+      } else {
+        key = `slack:${msg.channelId}`;
+      }
+    }
     const replyTo: ReplyTarget = {
       platform: "slack",
       channelId: msg.channelId,

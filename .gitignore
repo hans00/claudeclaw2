@@ -10,6 +10,9 @@ dist/
 .claude/claudeclaw/logs/
 .claude/claudeclaw/attachments/
 .claude/claudeclaw/daemon.pid
+.claude/claudeclaw/auth.token
+.claude/claudeclaw/state.json
+.claude/claudeclaw/daemon.sock
 
 # Bun
 bun.lock

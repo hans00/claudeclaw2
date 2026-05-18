@@ -66,6 +66,27 @@ export interface LineConfig {
   messageStream?: MessageStreamConfig;
 }
 
+/**
+ * How a Slack channel maps to ClaudeClaw sessions.
+ *
+ *   "channel"             — one session per channel; thread replies collapse
+ *                           into the channel session (Discord-style; default)
+ *   "thread-per-message"  — every top-level channel message starts its own
+ *                           session; thread replies join the parent's session.
+ *                           Suited for office workflows where each thread is
+ *                           a self-contained task. Pair with a short
+ *                           sessionCleanup.idleTimeoutHours so finished
+ *                           threads don't keep tmux alive.
+ */
+export type SlackChannelMode = "channel" | "thread-per-message";
+
+export interface SlackChannelConfig {
+  /** Per-channel override of slack.defaultMode. */
+  mode?: SlackChannelMode;
+  /** Per-channel override of slack.messageStream. */
+  messageStream?: MessageStreamConfig;
+}
+
 export interface SlackConfig {
   /** xapp-... token for Socket Mode. */
   appToken: string;
@@ -75,6 +96,10 @@ export interface SlackConfig {
   allowedUserIds: string[];
   /** Allowed bot ids (Slack B... ids). */
   allowedBotIds: string[];
+  /** Default channel mode for channels without explicit config. Default "channel". */
+  defaultMode: SlackChannelMode;
+  /** Per-channel overrides keyed by Slack channel id. */
+  channels: Record<string, SlackChannelConfig>;
   /** Default messageStream mode for Slack. Built-in default: "replace". */
   messageStream?: MessageStreamConfig;
 }
@@ -179,7 +204,14 @@ const SETTINGS_PATH = join(".claude", "claudeclaw", "settings.json");
 const DEFAULTS: Settings = {
   telegram: { token: "", allowedUserIds: [] },
   discord: { token: "", allowedUserIds: [], allowedBotIds: [], channels: {} },
-  slack: { appToken: "", botToken: "", allowedUserIds: [], allowedBotIds: [] },
+  slack: {
+    appToken: "",
+    botToken: "",
+    allowedUserIds: [],
+    allowedBotIds: [],
+    defaultMode: "channel",
+    channels: {},
+  },
   line: {
     channelAccessToken: "",
     channelSecret: "",
@@ -261,6 +293,25 @@ export async function loadSettings(): Promise<Settings> {
       allowedBotIds: Array.isArray(raw?.slack?.allowedBotIds)
         ? raw.slack.allowedBotIds.filter((x: unknown) => typeof x === "string")
         : DEFAULTS.slack.allowedBotIds,
+      defaultMode:
+        raw?.slack?.defaultMode === "thread-per-message" ? "thread-per-message" : "channel",
+      channels: (() => {
+        const out: Record<string, SlackChannelConfig> = {};
+        const src = raw?.slack?.channels;
+        if (src && typeof src === "object") {
+          for (const [id, cfg] of Object.entries(src)) {
+            if (!cfg || typeof cfg !== "object") continue;
+            const c = cfg as any;
+            const mode: SlackChannelMode | undefined =
+              c.mode === "thread-per-message" || c.mode === "channel" ? c.mode : undefined;
+            out[id] = {
+              mode,
+              messageStream: parseStreamCfg(c.messageStream),
+            };
+          }
+        }
+        return out;
+      })(),
       messageStream: parseStreamCfg(raw?.slack?.messageStream),
     },
     line: {
