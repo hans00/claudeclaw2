@@ -52,7 +52,12 @@ class Daemon {
   /** Permission dialogs waiting on operator decision. Keyed by short token
    *  embedded in the inline-keyboard callback_data so we can route incoming
    *  button presses back to the right channel's tmux session. */
-  private pendingApprovals = new Map<string, PendingApproval>();
+  /** Outstanding inline-keyboard interactions (approval dialogs, /model
+   *  pickers, anything else that prompts the operator with Telegram buttons).
+   *  Keyed by the short token embedded in callback_data. The interaction
+   *  carries its own onResolve closure so the daemon doesn't need to know
+   *  the kind-specific logic here. */
+  private pendingInteractions = new Map<string, PendingInteraction>();
   /** Per-channel outbound state for edit-in-place: while consecutive
    *  assistant-text events share the same Claude msg_id, we keep editing
    *  the same platform message instead of sending each segment as its own
@@ -809,7 +814,7 @@ class Daemon {
     if (modelMatch) {
       const arg = modelMatch[1]?.trim();
       if (!arg) {
-        await this.dispatchOutbound(channel.session, this.summarizeModels(channel), replyTo);
+        await this.openModelMenu(channel, replyTo);
         return true;
       }
       const ok = await channel.pinModel(arg);
@@ -820,6 +825,53 @@ class Daemon {
       return true;
     }
     return false;
+  }
+
+  /**
+   * Render the model picker as an inline-keyboard menu on Telegram (button
+   * per agentic mode + cancel). On other platforms we fall back to the
+   * text summary — they don't have button affordances wired yet.
+   *
+   * No auto-cancel timer — the menu is purely informational; if the user
+   * never picks, nothing's blocked.
+   */
+  private async openModelMenu(channel: Channel, replyTo: ReplyTarget): Promise<void> {
+    const a = this.settings.agentic;
+    const modes = a.modes ?? [];
+    if (replyTo?.platform !== "telegram" || !this.telegram || modes.length === 0) {
+      await this.dispatchOutbound(channel.session, this.summarizeModels(channel), replyTo);
+      return;
+    }
+    const chatId = replyTo.chatId;
+    const body = this.summarizeModels(channel);
+    const current = channel.model || this.settings.model;
+    const ok = await this.registerInteraction({
+      kind: "mdl",
+      session: channel.session,
+      chatId,
+      body,
+      buttonsFor: (token) => {
+        const rows = modes.map((m, i) => [{
+          text: `${m.model === current ? "● " : ""}${m.name} (${m.model})`,
+          callback_data: `mdl:${token}:${i + 1}`,
+        }]);
+        rows.push([{ text: "❌ Cancel", callback_data: `mdl:${token}:0` }]);
+        return rows;
+      },
+      onResolve: async (choice, actor) => {
+        if (choice === null) return "⏰ _Closed_";
+        if (choice === 0) return `❌ _Cancelled by ${actor ?? "user"}_`;
+        const mode = modes[choice - 1];
+        if (!mode) return "❓ _Invalid choice_";
+        const switched = await channel.pinModel(mode.model);
+        if (!switched) return `⚠️ _Switch to ${mode.model} failed — see log_`;
+        return `🎯 _Pinned to ${mode.name} (${mode.model}) by ${actor ?? "user"}_`;
+      },
+    });
+    if (!ok) {
+      // Telegram path failed — fall back to text so the user still sees something.
+      await this.dispatchOutbound(channel.session, body, replyTo);
+    }
   }
 
   private summarizeModels(channel: Channel): string {
@@ -1299,92 +1351,118 @@ class Daemon {
       return;
     }
 
-    const token = randomBytes(6).toString("hex");
-    const buttons = dialog.options.map((opt, i) => [{
-      text: numberedButtonLabel(i + 1, opt),
-      callback_data: `ap:${token}:${i + 1}`,
-    }]);
-    buttons.push([{ text: "❌ Cancel (Esc)", callback_data: `ap:${token}:0` }]);
-
     const body = formatApprovalPrompt(session.channelKey, dialog);
-    const msgId = await this.telegram.sendInlineKeyboard(telegramChatId, body, buttons);
-    if (!msgId) {
-      console.warn(`[approval] sendInlineKeyboard failed for ${session.channelKey} — auto-cancelling`);
-      await api.cancel();
-      return;
-    }
+    const buttons = (token: string) => {
+      const rows = dialog.options.map((opt, i) => [{
+        text: numberedButtonLabel(i + 1, opt),
+        callback_data: `ap:${token}:${i + 1}`,
+      }]);
+      rows.push([{ text: "❌ Cancel (Esc)", callback_data: `ap:${token}:0` }]);
+      return rows;
+    };
 
-    const timer = setTimeout(() => {
-      void this.resolveApproval(token, null);
-    }, cfg.timeoutSeconds * 1000);
-
-    this.pendingApprovals.set(token, {
+    const registered = await this.registerInteraction({
+      kind: "ap",
       session,
-      api,
-      dialog,
-      platform: "telegram",
       chatId: telegramChatId,
-      platformMsgId: msgId,
-      timer,
-      bodyBase: body,
+      body,
+      buttonsFor: buttons,
+      timeoutMs: cfg.timeoutSeconds * 1000,
+      onResolve: async (choice, actor) => {
+        if (choice === null) {
+          await api.cancel();
+          return "⏰ _Timed out — cancelled_";
+        }
+        if (choice === 0) {
+          await api.cancel();
+          return `❌ _Cancelled by ${actor ?? "user"}_`;
+        }
+        const label = dialog.options[choice - 1] ?? `option ${choice}`;
+        await api.selectOption(choice);
+        return `✅ _Picked "${label}" by ${actor ?? "user"}_`;
+      },
     });
+    if (!registered) {
+      console.warn(`[approval] failed to register for ${session.channelKey} — auto-cancelling`);
+      await api.cancel();
+    }
+  }
 
-    console.log(`[approval] ${session.channelKey} prompt sent (token ${token})`);
+  /**
+   * Send a Telegram inline keyboard and remember the token so the operator's
+   * tap routes back to `onResolve`. Returns true on success. Use `timeoutMs`
+   * to auto-resolve with `choice = null` after a delay; omit it for prompts
+   * that can sit indefinitely (model picks etc).
+   */
+  private async registerInteraction(opts: {
+    kind: string;
+    session: ChannelSession;
+    chatId: number;
+    body: string;
+    buttonsFor: (token: string) => Array<Array<{ text: string; callback_data: string }>>;
+    timeoutMs?: number;
+    onResolve: PendingInteraction["onResolve"];
+  }): Promise<boolean> {
+    if (!this.telegram) return false;
+    const token = randomBytes(6).toString("hex");
+    const buttons = opts.buttonsFor(token);
+    const msgId = await this.telegram.sendInlineKeyboard(opts.chatId, opts.body, buttons);
+    if (!msgId) return false;
+    const interaction: PendingInteraction = {
+      session: opts.session,
+      platform: "telegram",
+      chatId: opts.chatId,
+      platformMsgId: msgId,
+      bodyBase: opts.body,
+      onResolve: opts.onResolve,
+    };
+    if (opts.timeoutMs && opts.timeoutMs > 0) {
+      interaction.timer = setTimeout(() => {
+        void this.resolveInteraction(token, null);
+      }, opts.timeoutMs);
+    }
+    this.pendingInteractions.set(token, interaction);
+    console.log(`[interaction] ${opts.kind} ${opts.session.channelKey} sent (token ${token})`);
+    return true;
   }
 
   private async handleTelegramCallback(cb: TelegramCallbackInbound): Promise<void> {
-    const m = cb.data.match(/^ap:([a-f0-9]+):(\d+)$/);
+    // Callback data shape: `<kind>:<token>:<choice>`. We don't actually
+    // dispatch on `kind` here — onResolve closures own the logic — but the
+    // prefix is kept human-readable for log debugging.
+    const m = cb.data.match(/^[a-z]+:([a-f0-9]+):(-?\d+)$/);
     if (!m) {
       await this.telegram?.answerCallbackQuery(cb.callbackQueryId, "Unknown action");
       return;
     }
     const token = m[1];
     const choice = Number(m[2]);
-    const pending = this.pendingApprovals.get(token);
-    if (!pending) {
+    if (!this.pendingInteractions.has(token)) {
       await this.telegram?.answerCallbackQuery(cb.callbackQueryId, "Expired");
       return;
     }
     await this.telegram?.answerCallbackQuery(cb.callbackQueryId);
-    await this.resolveApproval(token, choice, cb.fromName);
+    await this.resolveInteraction(token, choice, cb.fromName);
   }
 
-  private async resolveApproval(
+  private async resolveInteraction(
     token: string,
     choice: number | null,
     actor?: string,
   ): Promise<void> {
-    const pending = this.pendingApprovals.get(token);
-    if (!pending) return;
-    this.pendingApprovals.delete(token);
-    clearTimeout(pending.timer);
-
+    const p = this.pendingInteractions.get(token);
+    if (!p) return;
+    this.pendingInteractions.delete(token);
+    if (p.timer) clearTimeout(p.timer);
     try {
-      if (choice === null) {
-        await pending.api.cancel();
-        await this.telegram?.editMessage(
-          pending.chatId,
-          pending.platformMsgId,
-          `⏰ _Timed out — cancelled_\n\n${pending.bodyBase}`,
-        );
-      } else if (choice === 0) {
-        await pending.api.cancel();
-        await this.telegram?.editMessage(
-          pending.chatId,
-          pending.platformMsgId,
-          `❌ _Cancelled by ${actor ?? "user"}_\n\n${pending.bodyBase}`,
-        );
-      } else {
-        const label = pending.dialog.options[choice - 1] ?? `option ${choice}`;
-        await pending.api.selectOption(choice);
-        await this.telegram?.editMessage(
-          pending.chatId,
-          pending.platformMsgId,
-          `✅ _Picked "${label}" by ${actor ?? "user"}_\n\n${pending.bodyBase}`,
-        );
-      }
+      const outcome = await p.onResolve(choice, actor);
+      await this.telegram?.editMessage(
+        p.chatId,
+        p.platformMsgId,
+        `${outcome}\n\n${p.bodyBase}`,
+      );
     } catch (err) {
-      console.error(`[approval] resolve ${token} failed:`, err);
+      console.error(`[interaction] resolve ${token} failed:`, err);
     }
   }
 
@@ -1682,17 +1760,33 @@ interface ProgressContent {
   lastResult: string;
 }
 
-interface PendingApproval {
+/**
+ * Generic Telegram inline-keyboard interaction. Both approval dialogs and
+ * `/model` button menus use the same shape — the differences are encoded in
+ * the `kind` prefix (so the callback_data parser can route) and the
+ * `onResolve` closure (which handles the kind-specific action).
+ */
+interface PendingInteraction {
   session: ChannelSession;
-  api: ApprovalApi;
-  dialog: PermissionDialog;
   platform: "telegram";
   chatId: number;
   platformMsgId: string;
-  timer: ReturnType<typeof setTimeout>;
   /** The body we initially posted, kept so we can prepend the outcome
    *  line during the final edit. */
   bodyBase: string;
+  /**
+   * Optional auto-cancel timer. Approvals set this so the agent (blocked
+   * in tmux on a permission dialog) doesn't wait forever. Model picks
+   * leave it undefined — the menu can sit indefinitely without harm.
+   */
+  timer?: ReturnType<typeof setTimeout>;
+  /**
+   * Invoked when the operator taps a button (or the optional timer fires
+   * with `choice = null`). `choice` is 1..N for an option, 0 for an
+   * explicit cancel button, or `null` for timeout. Returns the outcome
+   * line to prepend during the message edit (e.g. `✅ _Picked "Yes"_`).
+   */
+  onResolve(choice: number | null, actor?: string): Promise<string>;
 }
 
 function numberedButtonLabel(n: number, text: string): string {

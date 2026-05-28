@@ -41,6 +41,7 @@ const DAEMON_COMMANDS: SlashCommandDef[] = [
   { name: "stop",   originalName: "stop",   description: "Stop the current running turn and clear the queue" },
   { name: "status", originalName: "status", description: "Show daemon status and current channel state" },
   { name: "usage",  originalName: "usage",  description: "Show Claude Code rate-limit usage (5h and weekly quota)" },
+  { name: "model",  originalName: "model",  description: "Pick / pin a Claude model (no args shows a button menu)" },
 ];
 
 /**
