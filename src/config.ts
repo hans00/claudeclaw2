@@ -265,8 +265,8 @@ const DEFAULTS: Settings = {
     hysteresis: {
       confidenceThreshold: 0.75,
       scoreMargin: 2,
-      stickyWindowMinutes: 5,
-      stickyWindowTurns: 3,
+      stickyWindowMinutes: 30,
+      stickyWindowTurns: 5,
     },
   },
   telegramPollSeconds: 25,

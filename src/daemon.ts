@@ -801,7 +801,53 @@ class Daemon {
       await this.dispatchOutbound(channel.session, msg, replyTo);
       return true;
     }
+    // /model (and the namespaced /claudeclaw2:model) — list configured
+    // models when called without args, or pin a specific model when given
+    // one. Pinning bumps the channel's hysteresis sticky-window timestamp
+    // so agentic routing won't flip the user back out of the picked model.
+    const modelMatch = cmd.match(/^\/(?:claudeclaw2:)?model(?:\s+(.+))?$/);
+    if (modelMatch) {
+      const arg = modelMatch[1]?.trim();
+      if (!arg) {
+        await this.dispatchOutbound(channel.session, this.summarizeModels(channel), replyTo);
+        return true;
+      }
+      const ok = await channel.pinModel(arg);
+      const msg = ok
+        ? `🎯 Pinned model \`${arg}\` (sticky for ${this.settings.agentic.hysteresis.stickyWindowMinutes}min / ${this.settings.agentic.hysteresis.stickyWindowTurns} turns)`
+        : `⚠️ Failed to switch to \`${arg}\` — check daemon log`;
+      await this.dispatchOutbound(channel.session, msg, replyTo);
+      return true;
+    }
     return false;
+  }
+
+  private summarizeModels(channel: Channel): string {
+    const a = this.settings.agentic;
+    const lines: string[] = ["🤖 *Models*"];
+    const current = channel.model || this.settings.model || "(default)";
+    lines.push(`Current on this channel: \`${current}\``);
+    lines.push("");
+    if (this.settings.model) {
+      lines.push(`Default: \`${this.settings.model}\``);
+    }
+    if (a.enabled && a.modes.length > 0) {
+      lines.push("Agentic routing modes:");
+      for (const m of a.modes) {
+        const kw = m.keywords.join(", ").slice(0, 60);
+        lines.push(`  • \`${m.name}\` → \`${m.model}\`${kw ? ` — ${kw}` : ""}`);
+      }
+      lines.push("");
+      const h = a.hysteresis;
+      lines.push(
+        `Hysteresis: confidence ≥ ${h.confidenceThreshold}, margin ≥ ${h.scoreMargin}, sticky ${h.stickyWindowMinutes}min/${h.stickyWindowTurns} turns`,
+      );
+    } else {
+      lines.push("Agentic routing: _disabled_");
+    }
+    lines.push("");
+    lines.push("Use `/model <name>` to pin a specific model.");
+    return lines.join("\n");
   }
 
   private summarizeStatus(channel: Channel): string {

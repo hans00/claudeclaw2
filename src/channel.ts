@@ -1025,6 +1025,53 @@ export class Channel {
     return capturePane(this.opts.session.tmuxSession);
   }
 
+  /** The model the channel believes its claude process is on. Used by the
+   *  /model command to render "current" in the menu. */
+  get model(): string {
+    return this.currentModel;
+  }
+
+  /**
+   * Explicitly pin a model on this channel. Issues `/model <name>` to tmux
+   * and updates the hysteresis state so subsequent agentic routing respects
+   * the sticky window (i.e. won't immediately flip the user out of a model
+   * they just asked for).
+   *
+   * Returns false if we're not actually mid-turn and the input box may not
+   * be ready — the caller should handle that by retrying later or telling
+   * the user.
+   */
+  async pinModel(model: string): Promise<boolean> {
+    if (!model.trim()) return false;
+    const target = this.opts.session.tmuxSession;
+    try {
+      this.expectingModelEcho = true;
+      const echoReady = new Promise<void>((r) => {
+        this.modelEchoResolve = r;
+      });
+      await sendKeys(target, `/model ${model}`);
+      await new Promise((r) => setTimeout(r, 150));
+      await pressEnter(target);
+      await Promise.race([echoReady, new Promise((r) => setTimeout(r, MODEL_ECHO_TIMEOUT_MS))]);
+      this.modelEchoResolve = null;
+      await new Promise((r) => setTimeout(r, 300));
+      this.currentModel = model;
+      // Look up the mode name in the configured router so subsequent
+      // margin checks have an accurate `currentMode`. Falls back to "" so
+      // routing decisions just compare against score 0.
+      const mode = this.opts.agentic?.modes.find((m) => m.model === model);
+      this.currentMode = mode?.name ?? "";
+      this.lastModelSwitchAtMs = Date.now();
+      this.userTurnAtLastSwitch = this.userTurnCounter;
+      return true;
+    } catch (err) {
+      this.expectingModelEcho = false;
+      this.modelEchoResolve = null;
+      console.error(`[channel ${this.opts.session.channelKey}] pinModel failed:`, err);
+      return false;
+    }
+  }
+
   /** Hard shutdown: kill tmux, stop tailer. Used on daemon stop. */
   async shutdown(): Promise<void> {
     this.tailer?.stop();
