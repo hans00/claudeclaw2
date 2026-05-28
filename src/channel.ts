@@ -136,6 +136,15 @@ export interface QueueItem {
   /** Paste text verbatim, skipping the `[ts][source]\nMessage:` wrapper.
    *  Used for cron + heartbeat firings to match v1 behaviour. */
   rawPrompt?: boolean;
+  /**
+   * Skip agentic model routing for this item. Used for scheduled prompts
+   * (heartbeat, cron, daemon restart notice) — these are meta/system prompts
+   * whose classification is unstable (heartbeat is always "ambiguous", cron
+   * bodies look planning-ish on phrasing but should inherit the channel's
+   * current mode). Without this, scheduled prompts cause repeated cache-
+   * busting model swaps with no user intent behind them.
+   */
+  skipModelRouting?: boolean;
   /** When this item entered the queue. Set automatically by handleIncoming(). */
   receivedAt?: Date;
 }
@@ -300,10 +309,21 @@ export class Channel {
   /** The model the running `claude` process believes it's using. Updated on
    *  spawn and after each /model switch. */
   private currentModel: string = "";
+  /** Which agentic mode name the channel is currently considered to be in.
+   *  Mirrors `currentModel` but in router terms — used by the hysteresis
+   *  margin check to compare new mode's keyword score against THIS mode's
+   *  score in the same prompt, not just top-vs-second. */
+  private currentMode: string = "";
   /** True while we're waiting for the jsonl echo from a daemon-initiated
    *  `/model` switch. The corresponding `Set model to …` entry should NOT
    *  end the current turn — the user's actual prompt is what we're waiting on. */
   private expectingModelEcho: boolean = false;
+  /** Hysteresis state — see AgenticHysteresis docs. */
+  private lastModelSwitchAtMs: number = 0;
+  /** Counts user/manual turns (NOT scheduled). Used by stickyWindowTurns. */
+  private userTurnCounter: number = 0;
+  /** userTurnCounter snapshot at the last actual model switch. */
+  private userTurnAtLastSwitch: number = 0;
 
   constructor(private readonly opts: ChannelOptions) {
     this.currentModel = opts.defaultModel ?? "";
@@ -863,8 +883,12 @@ export class Channel {
     this.startTypingPulse();
     this.startApprovalPoll();
     this.armStallTimer();
+    // Count user turns (non-scheduled) for the sticky-window-turns gate
+    // in maybeSwitchModel. Bumped before classification so the new
+    // count is visible to the check on THIS turn.
+    if (!item.skipModelRouting) this.userTurnCounter++;
     try {
-      await this.maybeSwitchModel(item.text);
+      if (!item.skipModelRouting) await this.maybeSwitchModel(item.text);
       await pasteText(target, full);
       await new Promise((r) => setTimeout(r, 250));
       await pressEnter(target);
@@ -905,12 +929,63 @@ export class Channel {
     if (!agentic || !agentic.enabled || agentic.modes.length === 0) return;
     const routed = selectModel(promptText, agentic.modes, agentic.defaultMode);
     if (!routed.model) return;
-    if (routed.model === this.currentModel) return;
+    if (routed.model === this.currentModel) {
+      // Stayed in the same mode — track it so the hysteresis margin check
+      // has the current mode name to compare against next time.
+      if (routed.mode) this.currentMode = routed.mode;
+      return;
+    }
+
+    // Hysteresis gates — see AgenticHysteresis docs. Phrase matches
+    // (confidence ≥ 0.95) bypass all gates because they represent explicit
+    // user intent. Everything else requires confidence + score margin +
+    // sticky-window passes.
+    const h = agentic.hysteresis;
+    const key = this.opts.session.channelKey;
+    if (routed.confidence < 0.95 && h) {
+      const reasonsToSkip: string[] = [];
+      if (routed.confidence < h.confidenceThreshold) {
+        reasonsToSkip.push(
+          `confidence ${routed.confidence.toFixed(2)} < threshold ${h.confidenceThreshold}`,
+        );
+      }
+      // Margin: new mode's score minus the current mode's score on THIS
+      // prompt. If the current mode isn't in the scores list (e.g. first
+      // turn), treat its score as 0.
+      const newScore = routed.scores.find((s) => s.mode === routed.mode)?.score ?? 0;
+      const curScore = routed.scores.find((s) => s.mode === this.currentMode)?.score ?? 0;
+      if (newScore - curScore < h.scoreMargin) {
+        reasonsToSkip.push(
+          `margin ${(newScore - curScore).toFixed(1)} < ${h.scoreMargin} (${routed.mode}:${newScore} vs ${this.currentMode || "?"}:${curScore})`,
+        );
+      }
+      // Sticky window — only meaningful after at least one prior switch.
+      if (this.lastModelSwitchAtMs > 0) {
+        const minsSince = (Date.now() - this.lastModelSwitchAtMs) / 60_000;
+        if (minsSince < h.stickyWindowMinutes) {
+          reasonsToSkip.push(
+            `sticky-window minutes ${minsSince.toFixed(1)} < ${h.stickyWindowMinutes}`,
+          );
+        }
+        const turnsSince = this.userTurnCounter - this.userTurnAtLastSwitch;
+        if (turnsSince < h.stickyWindowTurns) {
+          reasonsToSkip.push(
+            `sticky-window turns ${turnsSince} < ${h.stickyWindowTurns}`,
+          );
+        }
+      }
+      if (reasonsToSkip.length > 0) {
+        console.log(
+          `[channel ${key}] /model ${routed.model} suppressed by hysteresis: ${reasonsToSkip.join("; ")} (${routed.reasoning})`,
+        );
+        return;
+      }
+    }
 
     const target = this.opts.session.tmuxSession;
     console.log(
-      `[channel ${this.opts.session.channelKey}] /model ${routed.model} ` +
-        `(was ${this.currentModel || "(default)"}, ${routed.reasoning})`,
+      `[channel ${key}] /model ${routed.model} ` +
+        `(was ${this.currentModel || "(default)"}, ${routed.reasoning}, confidence ${routed.confidence.toFixed(2)})`,
     );
     try {
       // Mark the next "Set model to …" jsonl echo as ours so it doesn't
@@ -930,6 +1005,9 @@ export class Channel {
       // Give the TUI a moment to clear the input box after the echo.
       await new Promise((r) => setTimeout(r, 300));
       this.currentModel = routed.model;
+      this.currentMode = routed.mode;
+      this.lastModelSwitchAtMs = Date.now();
+      this.userTurnAtLastSwitch = this.userTurnCounter;
     } catch (err) {
       this.expectingModelEcho = false;
       this.modelEchoResolve = null;

@@ -156,10 +156,33 @@ export interface AgenticMode {
   phrases?: string[];
 }
 
+/**
+ * Hysteresis gates that suppress model flip-flopping between turns. Each
+ * gate is bypassed when the router's confidence is at phrase-match level
+ * (≥ 0.95) — explicit user intent always wins. Otherwise switching from
+ * the current model requires ALL of:
+ *
+ *   - classification confidence ≥ confidenceThreshold
+ *   - new mode's keyword score is ≥ scoreMargin ABOVE the current mode's
+ *   - time since last switch ≥ stickyWindowMinutes
+ *   - user turns since last switch ≥ stickyWindowTurns
+ *
+ * Defaults pick reasonable values for the typical heartbeat-every-N-min
+ * + occasional-planning-prompt pattern: keep the cache warm unless the
+ * user has clearly steered toward a different mode.
+ */
+export interface AgenticHysteresis {
+  confidenceThreshold: number;
+  scoreMargin: number;
+  stickyWindowMinutes: number;
+  stickyWindowTurns: number;
+}
+
 export interface AgenticConfig {
   enabled: boolean;
   defaultMode: string;
   modes: AgenticMode[];
+  hysteresis: AgenticHysteresis;
 }
 
 /**
@@ -235,7 +258,17 @@ const DEFAULTS: Settings = {
   heartbeat: { enabled: false, interval: 60, prompt: "", excludeWindows: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   model: "",
-  agentic: { enabled: false, defaultMode: "", modes: [] },
+  agentic: {
+    enabled: false,
+    defaultMode: "",
+    modes: [],
+    hysteresis: {
+      confidenceThreshold: 0.75,
+      scoreMargin: 2,
+      stickyWindowMinutes: 5,
+      stickyWindowTurns: 3,
+    },
+  },
   telegramPollSeconds: 25,
   timezone: "",
   queue: { mode: "queue", debounceMs: 1500, cap: 20, dropPolicy: "summarize" },
@@ -403,6 +436,20 @@ export async function loadSettings(): Promise<Settings> {
               phrases: Array.isArray(m.phrases) ? m.phrases.filter((p: any) => typeof p === "string") : undefined,
             }))
         : DEFAULTS.agentic.modes,
+      hysteresis: {
+        confidenceThreshold: typeof raw?.agentic?.hysteresis?.confidenceThreshold === "number"
+          ? raw.agentic.hysteresis.confidenceThreshold
+          : DEFAULTS.agentic.hysteresis.confidenceThreshold,
+        scoreMargin: typeof raw?.agentic?.hysteresis?.scoreMargin === "number"
+          ? raw.agentic.hysteresis.scoreMargin
+          : DEFAULTS.agentic.hysteresis.scoreMargin,
+        stickyWindowMinutes: typeof raw?.agentic?.hysteresis?.stickyWindowMinutes === "number"
+          ? raw.agentic.hysteresis.stickyWindowMinutes
+          : DEFAULTS.agentic.hysteresis.stickyWindowMinutes,
+        stickyWindowTurns: typeof raw?.agentic?.hysteresis?.stickyWindowTurns === "number"
+          ? raw.agentic.hysteresis.stickyWindowTurns
+          : DEFAULTS.agentic.hysteresis.stickyWindowTurns,
+      },
     },
     telegramPollSeconds: typeof raw?.telegramPollSeconds === "number"
       ? raw.telegramPollSeconds

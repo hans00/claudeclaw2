@@ -264,6 +264,7 @@ class Daemon {
       text: parts.join("\n"),
       fromLabel: "daemon-restart",
       replyTo,
+      skipModelRouting: true,
     });
   }
 
@@ -377,6 +378,7 @@ class Daemon {
             fromLabel: "heartbeat",
             replyTo: null,
             rawPrompt: true,
+            skipModelRouting: true,
           });
           return true;
         },
@@ -415,6 +417,7 @@ class Daemon {
       text: job.body,
       fromLabel: `${sourceTag} · ${job.name} (${job.schedule})`,
       replyTo: job.replyTo,
+      skipModelRouting: true,
     });
   }
 

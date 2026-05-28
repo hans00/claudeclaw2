@@ -35,7 +35,14 @@ const SETTINGS_TEMPLATE = `{
         "model": "claude-sonnet-4-6",
         "keywords": ["implement", "code", "write", "fix", "test", "deploy", "commit"]
       }
-    ]
+    ],
+    "//hysteresis": "Gates to suppress model flip-flopping between turns. Phrase matches (confidence 0.95) bypass all gates. Otherwise switching requires: confidence >= confidenceThreshold AND new mode's score >= current mode's score + scoreMargin AND >= stickyWindowMinutes/Turns since last switch.",
+    "hysteresis": {
+      "confidenceThreshold": 0.75,
+      "scoreMargin": 2,
+      "stickyWindowMinutes": 5,
+      "stickyWindowTurns": 3
+    }
   },
   "timezone": "+00:00",
   "heartbeat": {
