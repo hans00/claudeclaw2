@@ -116,6 +116,15 @@ export interface ApprovalConfig {
   /** How long to wait for an operator response before auto-cancelling
    *  (sending Esc to the tmux dialog). */
   timeoutSeconds: number;
+  /**
+   * Handling for Claude Code's periodic "How is Claude doing this session?"
+   * feedback survey. The survey blocks the pane and produces no jsonl, so
+   * it has to be either auto-dismissed or surfaced to the operator.
+   *
+   *   "dismiss" — press 0 to dismiss the survey immediately (default)
+   *   "ask"     — forward as inline keyboard like a permission dialog
+   */
+  survey: "dismiss" | "ask";
 }
 
 export interface SessionCleanupConfig {
@@ -221,7 +230,7 @@ const DEFAULTS: Settings = {
     allowedGroupIds: [],
   },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
-  approval: { enabled: true, timeoutSeconds: 300 },
+  approval: { enabled: true, timeoutSeconds: 300, survey: "dismiss" },
   sessionCleanup: { idleTimeoutHours: 168, checkIntervalMinutes: 30 },
   heartbeat: { enabled: false, interval: 60, prompt: "", excludeWindows: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
@@ -351,6 +360,7 @@ export async function loadSettings(): Promise<Settings> {
       timeoutSeconds: typeof raw?.approval?.timeoutSeconds === "number"
         ? raw.approval.timeoutSeconds
         : DEFAULTS.approval.timeoutSeconds,
+      survey: raw?.approval?.survey === "ask" ? "ask" : DEFAULTS.approval.survey,
     },
     security: {
       level: raw?.security?.level ?? DEFAULTS.security.level,

@@ -88,9 +88,10 @@ const SETTINGS_TEMPLATE = `{
     "checkIntervalMinutes": 30
   },
   "approval": {
-    "//": "When the agent hits a permission dialog it can't auto-resolve, ask the operator via Telegram inline buttons. Decision sent into tmux as keystrokes. Auto-cancel after timeoutSeconds.",
+    "//": "When the agent hits a permission dialog it can't auto-resolve, ask the operator via Telegram inline buttons. Decision sent into tmux as keystrokes. Auto-cancel after timeoutSeconds. survey: 'dismiss' auto-presses Dismiss on the periodic 'How is Claude doing?' prompt; 'ask' surfaces it like a permission.",
     "enabled": true,
-    "timeoutSeconds": 300
+    "timeoutSeconds": 300,
+    "survey": "dismiss"
   },
   "security": {
     "level": "moderate",

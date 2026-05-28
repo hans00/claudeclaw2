@@ -1,46 +1,79 @@
 /**
- * Detect a Claude Code permission dialog in a tmux pane snapshot and
- * extract its question + numbered options, so the daemon can delegate
- * the decision to a trusted DM with inline buttons.
+ * Detect Claude Code TUI dialogs in a tmux pane snapshot and classify them
+ * so the daemon can either auto-handle them or surface them to a trusted
+ * operator via inline keyboard buttons.
  *
- * The dialog Claude Code shows looks like:
+ * Three kinds are recognised:
  *
- *      Bash command
- *        ls /tmp
- *        List files in /tmp
- *      Do you want to proceed?
- *      ❯ 1. Yes
- *        2. Yes, allow reading from tmp/ from this project
- *        3. No
- *      Esc to cancel · Tab to amend
+ *   - "permission" — the standard `Do you want to proceed? ❯ 1. Yes …`
+ *     block that gates risky tool calls (Bash not on the allowlist, etc).
+ *     Forwarded to the operator with the original title.
  *
- * We look for the `❯ N. <text>` block. The "question" is the contiguous
- * non-empty lines above the cursor row (until a separator), which gives
- * us enough context for the operator to decide.
+ *   - "model-switch" — Claude Code asks "Switch model?" with two options
+ *     when a /model change would invalidate an existing cache. Same `❯ N.`
+ *     block format as permission, but with a recognisable question. Tagged
+ *     separately so the operator UI can use a clearer title.
+ *
+ *   - "survey" — the periodic "How is Claude doing this session?" prompt.
+ *     Format is inline single-key shortcuts (`1: Bad   2: Fine   3: Good
+ *     0: Dismiss`) rather than the `❯ N.` block, so it needs its own
+ *     parser. Caller decides whether to auto-dismiss (digit "0") or forward.
  */
 
+export type DialogKind = "permission" | "model-switch" | "survey";
+
 export interface PermissionDialog {
-  /** Free-form context lines above the option list (tool name, command, etc). */
+  kind: DialogKind;
+  /** Free-form context lines above the option list. */
   question: string;
-  /** Each numbered option in display order; option N maps to (N-1) Down + Enter. */
+  /** Each numbered option in display order. */
   options: string[];
-  /** A stable digest of question+options — used to de-duplicate so we don't
-   *  re-send a Telegram prompt every poll while the user is still deciding. */
+  /** Stable digest used to de-duplicate so we don't re-send the operator
+   *  prompt every poll. */
   fingerprint: string;
+  /** When set, option N is answered by sending the literal digit key
+   *  `keypressMap[N]` instead of `(N-1) Down + Enter`. Used by surveys. */
+  keypressMap?: Record<number, string>;
 }
 
-/** Heuristics: a dialog is detected when we see `❯ <digit>. <text>` followed
- *  by additional `<digit>. <text>` lines. We don't require specific question
- *  text so this also catches future Claude Code prompts with different
- *  phrasings (model switch confirms, plan-mode prompts, etc.) */
-const DIALOG_RE = /❯\s*\d+\.\s*([^\n]+)\n((?:\s*\d+\.\s*[^\n]+\n)*)/;
+const BLOCK_DIALOG_RE = /❯\s*\d+\.\s*([^\n]+)\n((?:\s*\d+\.\s*[^\n]+\n)*)/;
+const SURVEY_HEADER_RE = /How is Claude doing this session\?[^\n]*\n([^\n]+)/;
 
-export function parsePermissionDialog(pane: string): PermissionDialog | null {
-  const match = pane.match(DIALOG_RE);
+function fingerprint(seed: string): string {
+  let h = 5381 >>> 0;
+  for (let i = 0; i < seed.length; i++) h = ((h * 33) ^ seed.charCodeAt(i)) >>> 0;
+  return h.toString(16);
+}
+
+function parseSurvey(pane: string): PermissionDialog | null {
+  const m = pane.match(SURVEY_HEADER_RE);
+  if (!m) return null;
+  // The next line is "1: Bad    2: Fine   3: Good   0: Dismiss". Extract
+  // each `<digit>: <label>` pair — the label runs until ≥2 spaces or EOL.
+  const optionsLine = m[1];
+  const optionMatches = [...optionsLine.matchAll(/(\d+):\s*([^\s][^\n]*?)(?=\s{2,}\d+:|\s*$)/g)];
+  if (optionMatches.length < 2) return null;
+  const options: string[] = [];
+  const keypressMap: Record<number, string> = {};
+  for (let i = 0; i < optionMatches.length; i++) {
+    const digit = optionMatches[i][1];
+    const label = optionMatches[i][2].trim();
+    options.push(label);
+    keypressMap[i + 1] = digit;
+  }
+  return {
+    kind: "survey",
+    question: "How is Claude doing this session? (optional)",
+    options,
+    fingerprint: fingerprint(`survey:${options.join("|")}`),
+    keypressMap,
+  };
+}
+
+function parseBlockDialog(pane: string): PermissionDialog | null {
+  const match = pane.match(BLOCK_DIALOG_RE);
   if (!match) return null;
 
-  // Build the options list. Include the first match (the `❯`-prefixed line)
-  // plus the additional `N. …` lines that follow.
   const optionsBlock = `1. ${match[1]}\n${match[2]}`;
   const options: string[] = [];
   for (const line of optionsBlock.split("\n")) {
@@ -52,8 +85,6 @@ export function parsePermissionDialog(pane: string): PermissionDialog | null {
   }
   if (options.length < 2) return null;
 
-  // Walk backwards from the match to gather the dialog's question/context —
-  // stop at a separator row (────…) or after 20 lines.
   const matchIdx = match.index ?? 0;
   const beforeLines = pane.slice(0, matchIdx).split("\n");
   const ctx: string[] = [];
@@ -66,15 +97,20 @@ export function parsePermissionDialog(pane: string): PermissionDialog | null {
   }
   const question = ctx.join("\n").trim();
 
-  // Filter out obvious non-permission dialogs — the bypass warning at first
-  // launch is handled by init-watch, not by this scanner.
   if (/Bypass Permissions mode/i.test(question)) return null;
 
-  // Fingerprint = simple djb2 of question + options
-  const seed = `${question}\n${options.join("|")}`;
-  let h = 5381 >>> 0;
-  for (let i = 0; i < seed.length; i++) h = ((h * 33) ^ seed.charCodeAt(i)) >>> 0;
-  const fingerprint = h.toString(16);
+  // Classify based on question content. "Switch model?" gets its own kind
+  // so the operator UI can label it clearly instead of "Permission needed".
+  const kind: DialogKind = /Switch model\?/i.test(question) ? "model-switch" : "permission";
 
-  return { question, options, fingerprint };
+  return {
+    kind,
+    question,
+    options,
+    fingerprint: fingerprint(`${kind}:${question}\n${options.join("|")}`),
+  };
+}
+
+export function parsePermissionDialog(pane: string): PermissionDialog | null {
+  return parseSurvey(pane) ?? parseBlockDialog(pane);
 }

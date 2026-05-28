@@ -1222,6 +1222,17 @@ class Daemon {
       return;
     }
 
+    // Survey auto-dismiss: settings.approval.survey === "dismiss" makes the
+    // periodic "How is Claude doing?" prompt vanish silently so the channel
+    // doesn't stall on it. "ask" falls through to the normal operator path.
+    if (dialog.kind === "survey" && cfg.survey === "dismiss") {
+      const dismissOption = dialog.options.findIndex((o) => /dismiss/i.test(o)) + 1;
+      const choice = dismissOption > 0 ? dismissOption : 1;
+      console.log(`[approval] auto-dismissing survey on ${session.channelKey} (option ${choice})`);
+      await api.selectOption(choice);
+      return;
+    }
+
     // Resolve DM target. Route to the originating platform's owner DM where
     // possible. Discord/Slack/LINE not yet wired — fall back to auto-cancel.
     let telegramChatId: number | undefined;
@@ -1644,10 +1655,20 @@ function numberedButtonLabel(n: number, text: string): string {
 }
 
 function formatApprovalPrompt(channelKey: string, dialog: PermissionDialog): string {
-  const lines: string[] = [
-    `🔐 _Permission needed_ · \`${channelKey}\``,
-    "",
-  ];
+  let header: string;
+  switch (dialog.kind) {
+    case "model-switch":
+      header = `🔁 _Switch model?_ · \`${channelKey}\``;
+      break;
+    case "survey":
+      header = `📋 _How is Claude doing this session?_ · \`${channelKey}\``;
+      break;
+    case "permission":
+    default:
+      header = `🔐 _Permission needed_ · \`${channelKey}\``;
+      break;
+  }
+  const lines: string[] = [header, ""];
   if (dialog.question) {
     lines.push("```");
     lines.push(dialog.question);

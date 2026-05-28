@@ -100,6 +100,12 @@ const TYPING_PULSE_MS = 4000;
  *  jsonl event came in — covers UI-only commands like `/reload-plugins`. */
 const SLASH_IDLE_TIMEOUT_MS = 2000;
 
+/** Wait this long after the user picks a model-switch dialog option (or
+ *  cancels) before synthesising turn-end. Long enough for the optional
+ *  `Set model to ...` jsonl echo to land if "Yes" was picked; short enough
+ *  that "Cancel" doesn't leave the channel stuck. */
+const MODEL_SWITCH_DIALOG_SETTLE_MS = 1500;
+
 /** How long with no jsonl activity before the stall watchdog fires. */
 const STALL_TIMEOUT_MS = 120_000;
 /** Absolute maximum stall time before forcing recovery regardless of pane state. */
@@ -488,7 +494,6 @@ export class Channel {
 
   private async checkForApprovalDialog(): Promise<void> {
     if (this.state !== "running" && this.state !== "interrupting") return;
-    if (!this.currentTurnReplyTo) return;
     if (!this.opts.callbacks.onApprovalNeeded) return;
     let pane: string;
     try {
@@ -503,22 +508,47 @@ export class Channel {
     }
     if (dialog.fingerprint === this.activeApprovalFp) return; // already raised
     this.activeApprovalFp = dialog.fingerprint;
+    // A dialog is up: the slash command DID produce output (a TUI dialog),
+    // so cancel the slash-idle synth-end timer — the dialog handler owns
+    // resolution from here.
+    this.clearSlashIdleTimer();
+
     const target = this.opts.session.tmuxSession;
     const api: ApprovalApi = {
       selectOption: async (index) => {
-        // 1-indexed; the cursor starts on option 1, so option N needs (N-1)
-        // Down keys then Enter.
-        const downs = Math.max(0, index - 1);
-        for (let i = 0; i < downs; i++) {
-          await sendKeys(target, "Down");
-          await new Promise((r) => setTimeout(r, 50));
+        // Survey dialogs accept a literal digit keypress. Block dialogs use
+        // arrow navigation: option N needs (N-1) Down + Enter (cursor starts
+        // on option 1).
+        if (dialog.keypressMap && dialog.keypressMap[index]) {
+          await sendKeys(target, dialog.keypressMap[index]);
+        } else {
+          const downs = Math.max(0, index - 1);
+          for (let i = 0; i < downs; i++) {
+            await sendKeys(target, "Down");
+            await new Promise((r) => setTimeout(r, 50));
+          }
+          await pressEnter(target);
         }
-        await pressEnter(target);
         this.activeApprovalFp = null;
+        // model-switch dialogs are the only kind that may not produce a
+        // jsonl event after the user picks (Cancel = no echo). Synthesise
+        // a turn-end after a grace period so the channel doesn't stick.
+        if (dialog.kind === "model-switch") {
+          setTimeout(() => {
+            if (this.state === "running" && !this.activeApprovalFp) this.onTurnEnd();
+          }, MODEL_SWITCH_DIALOG_SETTLE_MS);
+        }
       },
       cancel: async () => {
         await pressEscape(target);
         this.activeApprovalFp = null;
+        if (dialog.kind === "model-switch" || dialog.kind === "survey") {
+          // No jsonl event will follow an Esc on these — synth turn-end so
+          // we don't stall.
+          setTimeout(() => {
+            if (this.state === "running" && !this.activeApprovalFp) this.onTurnEnd();
+          }, MODEL_SWITCH_DIALOG_SETTLE_MS);
+        }
       },
     };
     try {
@@ -621,6 +651,22 @@ export class Channel {
     // Context compaction produces no jsonl output but is not a stall.
     // Skip diagnosis and recovery — just recheck until compaction finishes.
     if (/Compacting conversation/i.test(pane)) {
+      this.stallTimer = setTimeout(() => void this.onStall(), 60_000);
+      return;
+    }
+
+    // Long-running Bash (gradle builds, slow npm installs, long curls) shows
+    // a `Running… (Xm Ys · timeout 10m)` indicator and produces no jsonl
+    // until the tool returns. Don't count this as a stall — Claude Code's
+    // own timeout will eventually fire if the command really hangs.
+    if (/Running…|Running\.\.\./.test(pane)) {
+      this.stallTimer = setTimeout(() => void this.onStall(), 60_000);
+      return;
+    }
+
+    // Approval dialog up — ownership is with the operator (or the auto-
+    // dismiss handler). Don't false-alarm; just recheck.
+    if (this.activeApprovalFp) {
       this.stallTimer = setTimeout(() => void this.onStall(), 60_000);
       return;
     }
