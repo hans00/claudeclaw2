@@ -28,15 +28,19 @@ const SETTINGS_PATH = join(".claude", "claudeclaw", "settings.json");
 const RESTART_PENDING_PATH = join(".claude", "claudeclaw", "restart-pending.json");
 
 /**
- * Concrete Claude models offered in the `/model` button menu so the user
- * can switch directly without editing settings. Claude Code accepts both
- * the short alias and the full id for `/model`; we use the short alias as
- * it's stable across dated snapshots. Keep newest-first.
+ * Fallback model list for the `/model` menu, used ONLY when the live picker
+ * can't be queried (channel busy mid-turn, parse failure). The primary path
+ * is channel.listModels(), which reads the live `/model` picker so the menu
+ * auto-maintains with the installed Claude Code.
+ *
+ * Uses tier aliases (opus/sonnet/haiku) rather than dated ids so the
+ * resolved model always tracks the latest in each tier — the labels are
+ * intentionally version-agnostic for the same reason.
  */
 const KNOWN_MODELS: Array<{ label: string; id: string }> = [
-  { label: "Opus 4.8", id: "opus" },
-  { label: "Sonnet 4.6", id: "sonnet" },
-  { label: "Haiku 4.5", id: "haiku" },
+  { label: "Opus (latest)", id: "opus" },
+  { label: "Sonnet (latest)", id: "sonnet" },
+  { label: "Haiku (latest)", id: "haiku" },
 ];
 import {
   GLOBAL_KEY,
@@ -840,48 +844,62 @@ class Daemon {
   }
 
   /**
-   * Build the model picker choices: concrete Claude models first (so the
-   * user can switch model directly without touching settings), then any
-   * configured agentic modes, then a "reset to default" entry. Each choice
-   * resolves to the model id passed to `/model` (empty string → `default`).
-   */
-  private buildModelChoices(): Array<{ label: string; model: string }> {
-    const choices: Array<{ label: string; model: string }> = [];
-    const seen = new Set<string>();
-    const push = (label: string, model: string) => {
-      const key = model || "default";
-      if (seen.has(key)) return;
-      seen.add(key);
-      choices.push({ label, model });
-    };
-    for (const m of KNOWN_MODELS) push(m.label, m.id);
-    // Surface any models referenced by agentic modes that aren't in the
-    // curated list (custom / dated snapshots from settings).
-    for (const mode of this.settings.agentic.modes ?? []) {
-      push(`${mode.name} (${mode.model})`, mode.model);
-    }
-    push("↩︎ Default (clear pin)", "");
-    return choices;
-  }
-
-  /**
-   * Render the model picker as an inline-keyboard menu on Telegram (one
-   * button per concrete model + agentic modes + reset). On other platforms
-   * we fall back to the text summary — they don't have button affordances
-   * wired yet.
+   * Render the model picker as an inline-keyboard menu on Telegram, sourced
+   * from the LIVE `/model` picker (channel.listModels) so it auto-maintains
+   * with the installed Claude Code — no hardcoded model list to go stale.
+   * Falls back to a static alias list if the channel is busy or discovery
+   * fails. On non-Telegram platforms, text summary only.
    *
-   * No auto-cancel timer — the menu is purely informational; if the user
-   * never picks, nothing's blocked.
+   * No auto-cancel timer — the menu is informational; if the user never
+   * picks, nothing's blocked.
    */
   private async openModelMenu(channel: Channel, replyTo: ReplyTarget): Promise<void> {
-    const choices = this.buildModelChoices();
-    if (replyTo?.platform !== "telegram" || !this.telegram || choices.length === 0) {
+    if (replyTo?.platform !== "telegram" || !this.telegram) {
       await this.dispatchOutbound(channel.session, this.summarizeModels(channel), replyTo);
       return;
     }
     const chatId = replyTo.chatId;
+    const live = await channel.listModels();
+
+    if (live && live.length > 0) {
+      // Live picker path: buttons map 1:1 to picker indices; the apply step
+      // drives the picker by index so labels never need parsing into ids.
+      const header = [
+        "🤖 *Select model*",
+        "_Live list from Claude Code — applies to this session only._",
+      ].join("\n");
+      const ok = await this.registerInteraction({
+        kind: "mdl",
+        session: channel.session,
+        chatId,
+        body: header,
+        buttonsFor: (token) => {
+          const rows = live.map((o) => [{
+            text: `${o.isCurrent ? "● " : ""}${o.label} — ${o.description.split("·")[0].trim()}`.slice(0, 60),
+            callback_data: `mdl:${token}:${o.index}`,
+          }]);
+          rows.push([{ text: "❌ Cancel", callback_data: `mdl:${token}:0` }]);
+          return rows;
+        },
+        onResolve: async (choice, actor) => {
+          if (choice === null) return "⏰ _Closed_";
+          if (choice === 0) return `❌ _Cancelled by ${actor ?? "user"}_`;
+          const res = await channel.pickModelByIndex(choice);
+          if (!res.ok) return `⚠️ _Switch failed (channel busy?) — see log_`;
+          return `🎯 _Set to ${res.label} (this session) by ${actor ?? "user"}_`;
+        },
+      });
+      if (ok) return;
+    }
+
+    // Fallback: channel busy or discovery failed — offer the static alias
+    // list via pinModel (which sends `/model <alias>`).
     const body = this.summarizeModels(channel);
     const current = channel.model || this.settings.model;
+    const choices: Array<{ label: string; model: string }> = [
+      ...KNOWN_MODELS.map((m) => ({ label: m.label, model: m.id })),
+      { label: "↩︎ Default (clear pin)", model: "default" },
+    ];
     const ok = await this.registerInteraction({
       kind: "mdl",
       session: channel.session,
@@ -889,7 +907,7 @@ class Daemon {
       body,
       buttonsFor: (token) => {
         const rows = choices.map((c, i) => [{
-          text: `${c.model && c.model === current ? "● " : ""}${c.label}`,
+          text: `${c.model === current ? "● " : ""}${c.label}`,
           callback_data: `mdl:${token}:${i + 1}`,
         }]);
         rows.push([{ text: "❌ Cancel", callback_data: `mdl:${token}:0` }]);
@@ -900,16 +918,12 @@ class Daemon {
         if (choice === 0) return `❌ _Cancelled by ${actor ?? "user"}_`;
         const picked = choices[choice - 1];
         if (!picked) return "❓ _Invalid choice_";
-        const target = picked.model || "default";
-        const switched = await channel.pinModel(target);
-        if (!switched) return `⚠️ _Switch to ${target} failed — see log_`;
+        const switched = await channel.pinModel(picked.model);
+        if (!switched) return `⚠️ _Switch to ${picked.model} failed — see log_`;
         return `🎯 _Pinned to ${picked.label} by ${actor ?? "user"}_`;
       },
     });
-    if (!ok) {
-      // Telegram path failed — fall back to text so the user still sees something.
-      await this.dispatchOutbound(channel.session, body, replyTo);
-    }
+    if (!ok) await this.dispatchOutbound(channel.session, body, replyTo);
   }
 
   private summarizeModels(channel: Channel): string {

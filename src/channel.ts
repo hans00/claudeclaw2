@@ -12,7 +12,7 @@ import { mkdir, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
 import type { AgenticConfig, QueueConfig } from "./config";
-import { parsePermissionDialog, type PermissionDialog } from "./approval";
+import { parseModelPicker, parsePermissionDialog, type ModelPickerOption, type PermissionDialog } from "./approval";
 import { buildClaudeArgs, type SecurityConfig } from "./compose";
 import { drainInbox, formatInboxForPrompt } from "./inbox";
 import { type JsonlEvent, tailJsonl, type TailHandle } from "./jsonl";
@@ -1069,6 +1069,95 @@ export class Channel {
       this.modelEchoResolve = null;
       console.error(`[channel ${this.opts.session.channelKey}] pinModel failed:`, err);
       return false;
+    }
+  }
+
+  /**
+   * Query the live `/model` picker for the available model list. This is the
+   * auto-maintaining source of truth — it reflects whatever the installed
+   * Claude Code knows, so the menu never goes stale.
+   *
+   * Only runs when the channel is idle (poking the picker mid-turn would
+   * corrupt the running interaction). Returns null when busy or on parse
+   * failure — caller should fall back to a static list.
+   */
+  async listModels(): Promise<ModelPickerOption[] | null> {
+    if (this.state !== "idle") return null;
+    const target = this.opts.session.tmuxSession;
+    try {
+      await pasteText(target, "/model");
+      await new Promise((r) => setTimeout(r, 200));
+      await pressEnter(target);
+      await new Promise((r) => setTimeout(r, 1000));
+      const pane = await capturePane(target);
+      const options = parseModelPicker(pane);
+      await pressEscape(target);
+      await new Promise((r) => setTimeout(r, 200));
+      return options.length ? options : null;
+    } catch (err) {
+      console.error(`[channel ${this.opts.session.channelKey}] listModels failed:`, err);
+      try {
+        await pressEscape(target);
+      } catch {}
+      return null;
+    }
+  }
+
+  /**
+   * Select a model by its picker index, driving the live `/model` picker:
+   * open it, read the current cursor row, press Down the right number of
+   * times (the picker wraps, so we navigate relative to the cursor, never
+   * by homing), then press `s` to apply for this session only — so a remote
+   * pick doesn't change the operator's global default.
+   *
+   * Bumps the hysteresis sticky window so agentic routing won't immediately
+   * flip the user back out of the model they just picked.
+   */
+  async pickModelByIndex(targetIndex: number): Promise<{ ok: boolean; label?: string }> {
+    if (this.state !== "idle") return { ok: false };
+    const target = this.opts.session.tmuxSession;
+    try {
+      this.expectingModelEcho = true;
+      await pasteText(target, "/model");
+      await new Promise((r) => setTimeout(r, 200));
+      await pressEnter(target);
+      await new Promise((r) => setTimeout(r, 1000));
+      const options = parseModelPicker(await capturePane(target));
+      const targetOpt = options.find((o) => o.index === targetIndex);
+      const cursor = options.find((o) => o.isCursor)?.index;
+      if (!targetOpt || cursor === undefined || options.length === 0) {
+        await pressEscape(target);
+        this.expectingModelEcho = false;
+        return { ok: false };
+      }
+      const n = options.length;
+      const downs = (((targetIndex - cursor) % n) + n) % n;
+      for (let i = 0; i < downs; i++) {
+        await sendKeys(target, "Down");
+        await new Promise((r) => setTimeout(r, 80));
+      }
+      // `s` = apply for this session only (leaves the global default alone).
+      await sendKeys(target, "s");
+      await new Promise((r) => setTimeout(r, 400));
+      this.expectingModelEcho = false;
+      this.modelEchoResolve = null;
+      // Record state for hysteresis. We don't have the canonical model id
+      // from the picker (only the display label), so currentMode is cleared;
+      // the sticky window covers the resulting label/id mismatch until it
+      // expires, after which routing resumes from a clean classification.
+      this.currentModel = targetOpt.label;
+      this.currentMode = "";
+      this.lastModelSwitchAtMs = Date.now();
+      this.userTurnAtLastSwitch = this.userTurnCounter;
+      return { ok: true, label: targetOpt.label };
+    } catch (err) {
+      this.expectingModelEcho = false;
+      this.modelEchoResolve = null;
+      console.error(`[channel ${this.opts.session.channelKey}] pickModelByIndex failed:`, err);
+      try {
+        await pressEscape(target);
+      } catch {}
+      return { ok: false };
     }
   }
 

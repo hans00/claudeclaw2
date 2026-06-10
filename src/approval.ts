@@ -114,3 +114,47 @@ function parseBlockDialog(pane: string): PermissionDialog | null {
 export function parsePermissionDialog(pane: string): PermissionDialog | null {
   return parseSurvey(pane) ?? parseBlockDialog(pane);
 }
+
+/**
+ * One row of Claude Code's `/model` picker. The picker is the live source of
+ * truth for available models (it updates when the CLI updates), so we parse
+ * it rather than hardcoding a model list.
+ *
+ * Picker rendering (indented, numbered, two-space gap before description):
+ *
+ *     Select model
+ *       1. Default (recommended)  Opus 4.8 with 1M context · …
+ *       2. Fable                  Fable 5 · …
+ *     ❯ 6. Opus ✔                 Opus 4.8 · …
+ *     Enter to set as default · s to use this session only · Esc to cancel
+ */
+export interface ModelPickerOption {
+  index: number;
+  /** Short label, e.g. "Opus" or "Sonnet (1M context)". ✔/cursor stripped. */
+  label: string;
+  /** Right-hand description, e.g. "Opus 4.8 with 1M context · …". */
+  description: string;
+  /** True for the row the cursor (❯) is currently on. */
+  isCursor: boolean;
+  /** True for the row marked as the active model (✔). */
+  isCurrent: boolean;
+}
+
+export function parseModelPicker(pane: string): ModelPickerOption[] {
+  // Guard: only parse when the picker header is present, so we don't latch
+  // onto unrelated numbered lists elsewhere in the pane.
+  if (!/Select model/i.test(pane)) return [];
+  const out: ModelPickerOption[] = [];
+  for (const line of pane.split("\n")) {
+    const m = line.match(/^\s*(❯)?\s*(\d+)\.\s+(.+?)\s{2,}(.+?)\s*$/);
+    if (!m) continue;
+    const isCursor = !!m[1];
+    const index = Number(m[2]);
+    const rawLabel = m[3];
+    const isCurrent = /✔/.test(rawLabel);
+    const label = rawLabel.replace(/✔/g, "").trim();
+    const description = m[4].trim();
+    if (label) out.push({ index, label, description, isCursor, isCurrent });
+  }
+  return out;
+}
