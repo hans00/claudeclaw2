@@ -26,6 +26,18 @@ import { formatToolStatus } from "./tool-display";
 const PID_FILE = join(".claude", "claudeclaw", "daemon.pid");
 const SETTINGS_PATH = join(".claude", "claudeclaw", "settings.json");
 const RESTART_PENDING_PATH = join(".claude", "claudeclaw", "restart-pending.json");
+
+/**
+ * Concrete Claude models offered in the `/model` button menu so the user
+ * can switch directly without editing settings. Claude Code accepts both
+ * the short alias and the full id for `/model`; we use the short alias as
+ * it's stable across dated snapshots. Keep newest-first.
+ */
+const KNOWN_MODELS: Array<{ label: string; id: string }> = [
+  { label: "Opus 4.8", id: "opus" },
+  { label: "Sonnet 4.6", id: "sonnet" },
+  { label: "Haiku 4.5", id: "haiku" },
+];
 import {
   GLOBAL_KEY,
   loadSessions,
@@ -828,17 +840,42 @@ class Daemon {
   }
 
   /**
-   * Render the model picker as an inline-keyboard menu on Telegram (button
-   * per agentic mode + cancel). On other platforms we fall back to the
-   * text summary — they don't have button affordances wired yet.
+   * Build the model picker choices: concrete Claude models first (so the
+   * user can switch model directly without touching settings), then any
+   * configured agentic modes, then a "reset to default" entry. Each choice
+   * resolves to the model id passed to `/model` (empty string → `default`).
+   */
+  private buildModelChoices(): Array<{ label: string; model: string }> {
+    const choices: Array<{ label: string; model: string }> = [];
+    const seen = new Set<string>();
+    const push = (label: string, model: string) => {
+      const key = model || "default";
+      if (seen.has(key)) return;
+      seen.add(key);
+      choices.push({ label, model });
+    };
+    for (const m of KNOWN_MODELS) push(m.label, m.id);
+    // Surface any models referenced by agentic modes that aren't in the
+    // curated list (custom / dated snapshots from settings).
+    for (const mode of this.settings.agentic.modes ?? []) {
+      push(`${mode.name} (${mode.model})`, mode.model);
+    }
+    push("↩︎ Default (clear pin)", "");
+    return choices;
+  }
+
+  /**
+   * Render the model picker as an inline-keyboard menu on Telegram (one
+   * button per concrete model + agentic modes + reset). On other platforms
+   * we fall back to the text summary — they don't have button affordances
+   * wired yet.
    *
    * No auto-cancel timer — the menu is purely informational; if the user
    * never picks, nothing's blocked.
    */
   private async openModelMenu(channel: Channel, replyTo: ReplyTarget): Promise<void> {
-    const a = this.settings.agentic;
-    const modes = a.modes ?? [];
-    if (replyTo?.platform !== "telegram" || !this.telegram || modes.length === 0) {
+    const choices = this.buildModelChoices();
+    if (replyTo?.platform !== "telegram" || !this.telegram || choices.length === 0) {
       await this.dispatchOutbound(channel.session, this.summarizeModels(channel), replyTo);
       return;
     }
@@ -851,8 +888,8 @@ class Daemon {
       chatId,
       body,
       buttonsFor: (token) => {
-        const rows = modes.map((m, i) => [{
-          text: `${m.model === current ? "● " : ""}${m.name} (${m.model})`,
+        const rows = choices.map((c, i) => [{
+          text: `${c.model && c.model === current ? "● " : ""}${c.label}`,
           callback_data: `mdl:${token}:${i + 1}`,
         }]);
         rows.push([{ text: "❌ Cancel", callback_data: `mdl:${token}:0` }]);
@@ -861,11 +898,12 @@ class Daemon {
       onResolve: async (choice, actor) => {
         if (choice === null) return "⏰ _Closed_";
         if (choice === 0) return `❌ _Cancelled by ${actor ?? "user"}_`;
-        const mode = modes[choice - 1];
-        if (!mode) return "❓ _Invalid choice_";
-        const switched = await channel.pinModel(mode.model);
-        if (!switched) return `⚠️ _Switch to ${mode.model} failed — see log_`;
-        return `🎯 _Pinned to ${mode.name} (${mode.model}) by ${actor ?? "user"}_`;
+        const picked = choices[choice - 1];
+        if (!picked) return "❓ _Invalid choice_";
+        const target = picked.model || "default";
+        const switched = await channel.pinModel(target);
+        if (!switched) return `⚠️ _Switch to ${target} failed — see log_`;
+        return `🎯 _Pinned to ${picked.label} by ${actor ?? "user"}_`;
       },
     });
     if (!ok) {
@@ -898,7 +936,7 @@ class Daemon {
       lines.push("Agentic routing: _disabled_");
     }
     lines.push("");
-    lines.push("Use `/model <name>` to pin a specific model.");
+    lines.push("Tap a model below, or use `/model <name>` (e.g. `opus`, `sonnet`, `haiku`, or a full id).");
     return lines.join("\n");
   }
 
