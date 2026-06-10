@@ -38,6 +38,7 @@ const RESTART_PENDING_PATH = join(".claude", "claudeclaw", "restart-pending.json
  * intentionally version-agnostic for the same reason.
  */
 const KNOWN_MODELS: Array<{ label: string; id: string }> = [
+  { label: "Fable (latest)", id: "fable" },
   { label: "Opus (latest)", id: "opus" },
   { label: "Sonnet (latest)", id: "sonnet" },
   { label: "Haiku (latest)", id: "haiku" },
