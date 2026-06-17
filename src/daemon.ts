@@ -823,6 +823,46 @@ class Daemon {
       await this.dispatchOutbound(channel.session, msg, replyTo);
       return true;
     }
+    // /clear — soft clear: forward native /clear (keeps the same session id
+    // + jsonl, so the tail stays valid). Falls back to a hard reset if the
+    // tmux process is gone.
+    if (cmd === "/clear" || cmd === "/claudeclaw2:clear") {
+      const res = await channel.softClear();
+      if (res.ok) {
+        await this.dispatchOutbound(
+          channel.session,
+          `🧼 Cleared context (session \`${channel.session.sessionId.slice(0, 8)}\` kept warm)`,
+          replyTo,
+        );
+      } else if (res.busy) {
+        await this.dispatchOutbound(channel.session, "⚠️ Busy mid-turn — /stop first, then /clear", replyTo);
+      } else {
+        // tmux gone — fall through to a hard reset so the user still ends
+        // up with a fresh, tracked session.
+        const newId = await channel.hardReset();
+        await this.dispatchOutbound(
+          channel.session,
+          newId
+            ? `🧹 Agent was down — hard-reset to new session \`${newId.slice(0, 8)}\``
+            : "❌ Clear failed and hard reset failed — check daemon log",
+          replyTo,
+        );
+      }
+      return true;
+    }
+    // /reset — hard reset: respawn the agent on a fresh session UUID. Always
+    // a clean slate; session tracking stays correct because we own the id.
+    if (cmd === "/reset" || cmd === "/claudeclaw2:reset") {
+      const newId = await channel.hardReset();
+      await this.dispatchOutbound(
+        channel.session,
+        newId
+          ? `🧹 Reset — new session \`${newId.slice(0, 8)}\` (fresh context)`
+          : "❌ Reset failed — check daemon log",
+        replyTo,
+      );
+      return true;
+    }
     // /model (and the namespaced /claudeclaw2:model) — list configured
     // models when called without args, or pin a specific model when given
     // one. Pinning bumps the channel's hysteresis sticky-window timestamp

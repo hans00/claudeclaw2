@@ -8,6 +8,7 @@
  *
  * Emits outbound events via callbacks; platform connectors implement them.
  */
+import { randomUUID } from "crypto";
 import { mkdir, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
@@ -17,7 +18,7 @@ import { buildClaudeArgs, type SecurityConfig } from "./compose";
 import { drainInbox, formatInboxForPrompt } from "./inbox";
 import { type JsonlEvent, tailJsonl, type TailHandle } from "./jsonl";
 import { selectModel } from "./model-router";
-import { type ChannelSession } from "./sessions";
+import { upsertSession, type ChannelSession } from "./sessions";
 import {
   capturePane,
   hasSession,
@@ -1158,6 +1159,91 @@ export class Channel {
         await pressEscape(target);
       } catch {}
       return { ok: false };
+    }
+  }
+
+  /**
+   * Soft clear: forward Claude Code's native `/clear` into the running
+   * process. In the current CLI this resets the conversation context but
+   * keeps the same session id + jsonl file, so the tailer keeps working and
+   * session tracking needs no change. Fast (no respawn).
+   *
+   * Returns:
+   *   { ok: true }                — cleared in place
+   *   { ok: false, busy: true }   — channel mid-turn; caller should tell the
+   *                                 user to /stop first
+   *   { ok: false, dead: true }   — tmux gone; caller should fall back to a
+   *                                 hard reset
+   */
+  async softClear(): Promise<{ ok: boolean; busy?: boolean; dead?: boolean }> {
+    if (this.state !== "idle") return { ok: false, busy: true };
+    const target = this.opts.session.tmuxSession;
+    if (!(await hasSession(target))) return { ok: false, dead: true };
+    try {
+      // Mark the resulting `/clear` system output as expected so the
+      // classifier doesn't treat it as a stray turn / forward it onward.
+      this.expectingModelEcho = false;
+      await pasteText(target, "/clear");
+      await new Promise((r) => setTimeout(r, 150));
+      await pressEnter(target);
+      await new Promise((r) => setTimeout(r, 800));
+      return { ok: true };
+    } catch (err) {
+      console.error(`[channel ${this.opts.session.channelKey}] softClear failed:`, err);
+      return { ok: false, dead: true };
+    }
+  }
+
+  /**
+   * Hard reset: tear the agent down and respawn it on a brand-new session
+   * UUID. Deterministic clean slate — we own the new id, so session tracking
+   * (sessions.json + the jsonl tail) is always correct afterward. Heavier
+   * than softClear (re-runs init/bootstrap) but always works, and is the
+   * fallback when forwarding `/clear` isn't possible.
+   *
+   * Returns the new session id, or null on respawn failure.
+   */
+  async hardReset(): Promise<string | null> {
+    const oldId = this.opts.session.sessionId;
+    const newId = randomUUID();
+    // Tear down all timers + the tailer + the tmux process.
+    this.tailer?.stop();
+    this.tailer = null;
+    if (this.interruptTimer) { clearTimeout(this.interruptTimer); this.interruptTimer = null; }
+    this.clearSlashIdleTimer();
+    this.clearStallTimer();
+    this.stopTypingPulse();
+    this.stopApprovalPoll();
+    this.queue = [];
+    try {
+      await killSession(this.opts.session.tmuxSession);
+    } catch {}
+    await new Promise((r) => setTimeout(r, 300));
+
+    // Adopt the new id and reset model/hysteresis tracking to defaults.
+    const now = new Date().toISOString();
+    this.opts.session.sessionId = newId;
+    this.opts.session.createdAt = now;
+    this.opts.session.lastActivityAt = now;
+    this.currentModel = this.opts.defaultModel ?? "";
+    this.currentMode = "";
+    this.lastModelSwitchAtMs = 0;
+    this.userTurnCounter = 0;
+    this.userTurnAtLastSwitch = 0;
+    try {
+      await upsertSession(this.opts.session);
+    } catch (err) {
+      console.error(`[channel ${this.opts.session.channelKey}] hardReset persist failed:`, err);
+    }
+
+    this.state = "spawning";
+    try {
+      await this.start({ resume: false });
+      console.log(`[channel ${this.opts.session.channelKey}] hard reset ${oldId.slice(0, 8)} → ${newId.slice(0, 8)}`);
+      return newId;
+    } catch (err) {
+      console.error(`[channel ${this.opts.session.channelKey}] hardReset respawn failed:`, err);
+      return null;
     }
   }
 
