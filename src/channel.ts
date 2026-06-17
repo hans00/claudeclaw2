@@ -414,7 +414,12 @@ export class Channel {
   private startTailing(): void {
     if (this.tailer) return;
     const path = jsonlPathFor(this.opts.session.sessionId, this.opts.projectDir);
-    this.tailer = tailJsonl(path, (ev) => this.onJsonlEvent(ev));
+    // waitForCreateMs: 0 → wait indefinitely for the jsonl to appear. After a
+    // /reset the new session's file isn't written until the next message,
+    // which may be minutes away; the old 30s default made the tailer give up
+    // and silently stop tracking. The channel stop()s this tailer explicitly
+    // on shutdown/reset, so an unbounded wait can't leak.
+    this.tailer = tailJsonl(path, (ev) => this.onJsonlEvent(ev), { waitForCreateMs: 0 });
   }
 
   private async onJsonlEvent(ev: JsonlEvent): Promise<void> {

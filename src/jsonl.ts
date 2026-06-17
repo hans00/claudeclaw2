@@ -154,7 +154,11 @@ export interface TailHandle {
 export interface TailOptions {
   /** Emit events for content already in the file before tail starts. Default false. */
   fromStart?: boolean;
-  /** Max ms to wait for the file to be created. Default 30_000. */
+  /** Max ms to wait for the file to be created. Default 30_000.
+   *  Set to 0 (or negative) to wait indefinitely — appropriate for a
+   *  long-lived tailer whose owner explicitly calls stop(), e.g. a channel
+   *  that may sit idle for minutes after a reset before its first message
+   *  recreates the jsonl. */
   waitForCreateMs?: number;
 }
 
@@ -257,7 +261,10 @@ export function tailJsonl(
     // Wait for file creation by watching parent dir.
     const parent = dirname(path);
     const target = basename(path);
-    const deadline = Date.now() + (opts.waitForCreateMs ?? 30_000);
+    const waitMs = opts.waitForCreateMs ?? 30_000;
+    // waitMs <= 0 → wait forever (until stop()). The poll below only exits on
+    // `stopped` in that case.
+    const deadline = waitMs <= 0 ? Infinity : Date.now() + waitMs;
     // Claude Code creates this dir on first write — pre-create so fs.watch
     // has something to attach to. Safe: claude is happy with a pre-existing dir.
     await mkdir(parent, { recursive: true }).catch(() => {});
