@@ -256,7 +256,7 @@ const DEFAULTS: Settings = {
   approval: { enabled: true, timeoutSeconds: 300, survey: "dismiss" },
   sessionCleanup: { idleTimeoutHours: 168, checkIntervalMinutes: 30 },
   heartbeat: { enabled: false, interval: 60, prompt: "", excludeWindows: [] },
-  security: { level: "moderate", allowedTools: [], disallowedTools: [] },
+  security: { level: "moderate", allowedTools: [], disallowedTools: [], skipPermissions: false },
   model: "",
   agentic: {
     enabled: false,
@@ -401,6 +401,7 @@ export async function loadSettings(): Promise<Settings> {
       disallowedTools: Array.isArray(raw?.security?.disallowedTools)
         ? raw.security.disallowedTools
         : [],
+      skipPermissions: raw?.security?.skipPermissions === true,
     },
     heartbeat: {
       enabled: typeof raw?.heartbeat?.enabled === "boolean"

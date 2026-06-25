@@ -20,6 +20,14 @@ export interface SecurityConfig {
   level: SecurityLevel;
   allowedTools: string[];
   disallowedTools: string[];
+  /**
+   * Pass `--dangerously-skip-permissions` to claude (auto-approve every
+   * tool, no permission prompts). Off by default — when off, claude uses
+   * its normal permission system and the daemon's approval flow forwards
+   * dialogs to the operator. Only enable if you explicitly want unattended,
+   * no-questions-asked execution.
+   */
+  skipPermissions?: boolean;
 }
 
 const PROMPTS_DIR = "prompts";
@@ -119,7 +127,10 @@ export async function composeAppendSystemPrompt(opts: ComposeOptions): Promise<s
  * (src/runner.ts:318) — kept 1:1 so behaviour is unchanged.
  */
 export function buildSecurityArgs(security: SecurityConfig): string[] {
-  const args: string[] = ["--dangerously-skip-permissions"];
+  // Only skip permissions when explicitly requested. Otherwise claude keeps
+  // its normal permission prompts, which the daemon's approval flow can
+  // surface to the operator.
+  const args: string[] = security.skipPermissions ? ["--dangerously-skip-permissions"] : [];
 
   switch (security.level) {
     case "locked":

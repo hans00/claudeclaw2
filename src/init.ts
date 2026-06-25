@@ -101,9 +101,11 @@ const SETTINGS_TEMPLATE = `{
     "survey": "dismiss"
   },
   "security": {
+    "//": "skipPermissions: true adds --dangerously-skip-permissions (auto-approve every tool, no prompts). Off by default — when off, claude keeps its normal permission prompts and the daemon forwards them to your DM for approval.",
     "level": "moderate",
     "allowedTools": [],
-    "disallowedTools": []
+    "disallowedTools": [],
+    "skipPermissions": false
   }
 }
 `;
