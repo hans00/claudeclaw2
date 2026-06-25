@@ -60,6 +60,13 @@ export async function newSession(name: string, opts: NewSessionOptions = {}): Pr
     TMUX, "new-session", "-d", "-s", name,
     "-x", String(opts.width ?? 200),
     "-y", String(opts.height ?? 50),
+    // Scope HISTFILE=/dev/null to this session so the `claude --session-id …
+    // --append-system-prompt …` launch line (and anything else we drive into
+    // the pane) never lands in the user's shell history. Session-scoped via
+    // -e, so other tmux sessions are untouched. Shell-agnostic: both zsh and
+    // bash honour HISTFILE, and oh-my-zsh only sets it when empty so this
+    // non-empty value wins. Requires tmux ≥ 3.0.
+    "-e", "HISTFILE=/dev/null",
   ];
   if (opts.cwd) args.push("-c", opts.cwd);
   const r = await run(args);
