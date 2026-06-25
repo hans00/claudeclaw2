@@ -75,6 +75,11 @@ class Daemon {
    *  carries its own onResolve closure so the daemon doesn't need to know
    *  the kind-specific logic here. */
   private pendingInteractions = new Map<string, PendingInteraction>();
+  /** Per-channel temporary auto-approve deadline (epoch ms). While now <
+   *  this value, permission/model-switch dialogs on that channel are
+   *  auto-approved (select option 1) instead of prompting. Set via
+   *  /autoapprove. */
+  private autoApproveUntil = new Map<string, number>();
   /** Per-channel outbound state for edit-in-place: while consecutive
    *  assistant-text events share the same Claude msg_id, we keep editing
    *  the same platform message instead of sending each segment as its own
@@ -850,6 +855,36 @@ class Daemon {
       }
       return true;
     }
+    // /autoapprove [minutes|off] — temporarily auto-approve permission +
+    // model-switch dialogs on this channel so the operator doesn't have to
+    // watch. Default 30 min. `off` cancels.
+    const autoMatch = cmd.match(/^\/(?:claudeclaw2:)?(?:autoapprove|yolo)(?:\s+(.+))?$/);
+    if (autoMatch) {
+      const arg = autoMatch[1]?.trim().toLowerCase();
+      const key = channel.session.channelKey;
+      if (arg === "off" || arg === "0" || arg === "stop") {
+        this.autoApproveUntil.delete(key);
+        await this.dispatchOutbound(channel.session, "🔒 Auto-approve off — dialogs will ask again", replyTo);
+        return true;
+      }
+      if (!arg) {
+        const until = this.autoApproveUntil.get(key) ?? 0;
+        const remainMin = Math.max(0, Math.round((until - Date.now()) / 60000));
+        const msg = remainMin > 0
+          ? `🟢 Auto-approve ON — ${remainMin} min left. \`/autoapprove off\` to stop.`
+          : "🔒 Auto-approve off. `/autoapprove <minutes>` to enable (default 30).";
+        await this.dispatchOutbound(channel.session, msg, replyTo);
+        return true;
+      }
+      const mins = Math.min(720, Math.max(1, Math.round(Number(arg) || 30)));
+      this.autoApproveUntil.set(key, Date.now() + mins * 60_000);
+      await this.dispatchOutbound(
+        channel.session,
+        `🟢 Auto-approving all dialogs on this channel for ${mins} min. \`/autoapprove off\` to stop early.`,
+        replyTo,
+      );
+      return true;
+    }
     // /reset — hard reset: respawn the agent on a fresh session UUID. Always
     // a clean slate; session tracking stays correct because we own the id.
     if (cmd === "/reset" || cmd === "/claudeclaw2:reset") {
@@ -1416,6 +1451,19 @@ class Daemon {
       return;
     }
 
+    // Temporary auto-approve window (set via /autoapprove). While active for
+    // this channel, approve permission/model-switch dialogs by selecting the
+    // first (proceed) option without bothering the operator. Surveys still
+    // follow the survey setting below.
+    if (dialog.kind !== "survey") {
+      const until = this.autoApproveUntil.get(session.channelKey) ?? 0;
+      if (Date.now() < until) {
+        console.log(`[approval] auto-approving (window active) on ${session.channelKey}`);
+        await api.selectOption(1);
+        return;
+      }
+    }
+
     // Survey auto-dismiss: settings.approval.survey === "dismiss" makes the
     // periodic "How is Claude doing?" prompt vanish silently so the channel
     // doesn't stall on it. "ask" falls through to the normal operator path.
@@ -1461,6 +1509,7 @@ class Daemon {
       body,
       buttonsFor: buttons,
       timeoutMs: cfg.timeoutSeconds * 1000,
+      ephemeral: true,
       onResolve: async (choice, actor) => {
         if (choice === null) {
           await api.cancel();
@@ -1494,6 +1543,7 @@ class Daemon {
     body: string;
     buttonsFor: (token: string) => Array<Array<{ text: string; callback_data: string }>>;
     timeoutMs?: number;
+    ephemeral?: boolean;
     onResolve: PendingInteraction["onResolve"];
   }): Promise<boolean> {
     if (!this.telegram) return false;
@@ -1507,6 +1557,7 @@ class Daemon {
       chatId: opts.chatId,
       platformMsgId: msgId,
       bodyBase: opts.body,
+      ephemeral: opts.ephemeral,
       onResolve: opts.onResolve,
     };
     if (opts.timeoutMs && opts.timeoutMs > 0) {
@@ -1534,28 +1585,39 @@ class Daemon {
       await this.telegram?.answerCallbackQuery(cb.callbackQueryId, "Expired");
       return;
     }
-    await this.telegram?.answerCallbackQuery(cb.callbackQueryId);
-    await this.resolveInteraction(token, choice, cb.fromName);
+    const outcome = await this.resolveInteraction(token, choice, cb.fromName);
+    // Show the outcome as a transient toast (strip markdown). For ephemeral
+    // interactions the message itself is deleted, so the toast is the only
+    // feedback — keep it short.
+    const toast = outcome ? outcome.replace(/[_*`]/g, "").slice(0, 190) : undefined;
+    await this.telegram?.answerCallbackQuery(cb.callbackQueryId, toast);
   }
 
   private async resolveInteraction(
     token: string,
     choice: number | null,
     actor?: string,
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     const p = this.pendingInteractions.get(token);
-    if (!p) return;
+    if (!p) return undefined;
     this.pendingInteractions.delete(token);
     if (p.timer) clearTimeout(p.timer);
     try {
       const outcome = await p.onResolve(choice, actor);
-      await this.telegram?.editMessage(
-        p.chatId,
-        p.platformMsgId,
-        `${outcome}\n\n${p.bodyBase}`,
-      );
+      if (p.ephemeral) {
+        // Drop the resolved prompt so it doesn't clutter the chat.
+        await this.telegram?.deleteMessage(p.chatId, p.platformMsgId);
+      } else {
+        await this.telegram?.editMessage(
+          p.chatId,
+          p.platformMsgId,
+          `${outcome}\n\n${p.bodyBase}`,
+        );
+      }
+      return outcome;
     } catch (err) {
       console.error(`[interaction] resolve ${token} failed:`, err);
+      return undefined;
     }
   }
 
@@ -1874,10 +1936,17 @@ interface PendingInteraction {
    */
   timer?: ReturnType<typeof setTimeout>;
   /**
+   * When true, DELETE the prompt message on resolution instead of editing it
+   * to show the outcome. Used for approvals so resolved dialogs don't pile up
+   * in the chat — the outcome is shown as a transient callback toast instead.
+   */
+  ephemeral?: boolean;
+  /**
    * Invoked when the operator taps a button (or the optional timer fires
    * with `choice = null`). `choice` is 1..N for an option, 0 for an
    * explicit cancel button, or `null` for timeout. Returns the outcome
-   * line to prepend during the message edit (e.g. `✅ _Picked "Yes"_`).
+   * line (shown as a toast for ephemeral interactions, or prepended to the
+   * edited message otherwise).
    */
   onResolve(choice: number | null, actor?: string): Promise<string>;
 }
