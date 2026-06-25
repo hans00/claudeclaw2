@@ -111,6 +111,11 @@ const MODEL_SWITCH_DIALOG_SETTLE_MS = 1500;
 const STALL_TIMEOUT_MS = 120_000;
 /** Absolute maximum stall time before forcing recovery regardless of pane state. */
 const STALL_MAX_MS = 600_000;
+/** Even when the pane looks actively busy, force recovery past this ceiling —
+ *  the safety net for a frozen pane stuck showing a stale "busy" line. Set
+ *  generously so legitimately long tools (whisper transcription, big builds)
+ *  aren't killed mid-run. */
+const BUSY_HARD_CAP_MS = 1_800_000; // 30 min
 /** How long to wait for the /model echo before giving up and proceeding. */
 const MODEL_ECHO_TIMEOUT_MS = 3_000;
 
@@ -172,6 +177,28 @@ export interface ChannelOptions {
 
 function encodeProjectDir(projectDir: string): string {
   return projectDir.replace(/\//g, "-");
+}
+
+/**
+ * Heuristic: does the tmux pane show claude actively working rather than
+ * stalled? Such states produce no jsonl but must not trigger a stall.
+ *
+ * Signals:
+ *   - a running-tool line with an ellipsis ("Running 3 shell commands…",
+ *     "Running…") — a tool is mid-execution
+ *   - context compaction in progress
+ *   - "esc to interrupt" in the footer (shown while a turn is active)
+ *   - a live token counter ("↓ 1.4k tokens") — active generation
+ *   - a running elapsed timer ≥1 minute ("(3m 37s …)") on the spinner/tool
+ */
+function looksActivelyBusy(pane: string): boolean {
+  return (
+    /Running\b[^\n]*[…\.]/.test(pane) ||
+    /Compacting conversation/i.test(pane) ||
+    /esc to interrupt/i.test(pane) ||
+    /[↓↑]\s*[\d.,]+\s*k?\s*tokens/i.test(pane) ||
+    /\(\d+m\s+\d+s[^)]*\)/.test(pane)
+  );
 }
 
 function jsonlPathFor(sessionId: string, projectDir: string): string {
@@ -674,25 +701,12 @@ export class Channel {
       pane = await capturePane(this.opts.session.tmuxSession);
     } catch {}
 
-    // Context compaction produces no jsonl output but is not a stall.
-    // Skip diagnosis and recovery — just recheck until compaction finishes.
-    if (/Compacting conversation/i.test(pane)) {
-      this.stallTimer = setTimeout(() => void this.onStall(), 60_000);
-      return;
-    }
-
-    // Long-running Bash (gradle builds, slow npm installs, long curls) shows
-    // a `Running… (Xm Ys · timeout 10m)` indicator and produces no jsonl
-    // until the tool returns. Don't count this as a stall — Claude Code's
-    // own timeout will eventually fire if the command really hangs.
-    if (/Running…|Running\.\.\./.test(pane)) {
-      this.stallTimer = setTimeout(() => void this.onStall(), 60_000);
-      return;
-    }
-
-    // Approval dialog up — ownership is with the operator (or the auto-
-    // dismiss handler). Don't false-alarm; just recheck.
-    if (this.activeApprovalFp) {
+    // Transient-busy: claude is actively working (long-running tool, context
+    // compaction, active generation) or an approval is pending. These produce
+    // no jsonl but are NOT stalls — recheck without writing a diagnosis. The
+    // BUSY_HARD_CAP_MS ceiling is the safety net for a genuinely frozen pane
+    // that keeps showing a stale "busy" line forever.
+    if (stallMs < BUSY_HARD_CAP_MS && (this.activeApprovalFp || looksActivelyBusy(pane))) {
       this.stallTimer = setTimeout(() => void this.onStall(), 60_000);
       return;
     }
