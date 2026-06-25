@@ -66,16 +66,22 @@ const KNOWN_PROMPTS: PromptPattern[] = [
 ];
 
 /**
- * Ready when we see Claude Code's permission-mode indicator (`⏵⏵ ...`)
- * — that line only appears once the TUI has finished initializing and is
- * accepting input. We additionally require the prompt cursor `❯` to appear
- * somewhere in the pane. Both markers are very specific to Claude Code's
- * status line so a substring check is enough.
+ * Ready detection. Two cases:
+ *
+ *  1. Elevated permission modes (bypass / accept-edits) render the `⏵⏵`
+ *     status line once interactive — fast path.
+ *  2. DEFAULT permission mode renders NO `⏵⏵` line (it only appears in
+ *     elevated modes). So we can't require it, or sessions launched without
+ *     --dangerously-skip-permissions would never read as ready. Instead
+ *     detect the bordered input box — a `❯` prompt line sandwiched between
+ *     two horizontal rules — which only renders once the TUI is accepting
+ *     input, independent of permission mode and version.
  */
+const INPUT_BOX_RE = /─{20,}[ \t]*\n[ \t]*❯[^\n]*\n[ \t]*─{20,}/;
+
 function isReady(pane: string): boolean {
-  if (!pane.includes("⏵⏵")) return false;
-  if (!pane.includes("❯")) return false;
-  return true;
+  if (pane.includes("⏵⏵") && pane.includes("❯")) return true;
+  return INPUT_BOX_RE.test(pane);
 }
 
 function detectKnownPrompt(pane: string): PromptPattern | null {
