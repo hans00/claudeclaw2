@@ -80,6 +80,10 @@ class Daemon {
    *  auto-approved (select option 1) instead of prompting. Set via
    *  /autoapprove. */
   private autoApproveUntil = new Map<string, number>();
+  /** Per-channel most-recently-used reply target. Drives backgroundNotify
+   *  "last" mode so self-woken / background-completion output goes back to
+   *  wherever the channel last communicated. */
+  private lastReplyTo = new Map<string, ReplyTarget>();
   /** Per-channel outbound state for edit-in-place: while consecutive
    *  assistant-text events share the same Claude msg_id, we keep editing
    *  the same platform message instead of sending each segment as its own
@@ -1261,11 +1265,14 @@ class Daemon {
   ): Promise<void> {
     const { cleanText, reactions } = extractReactions(text);
     if (!replyTo) {
-      if (cleanText) {
-        console.log(`[daemon] [${session.channelKey}] no replyTo — logging only:\n${cleanText.slice(0, 500)}`);
-      }
+      // Orphan turn — the agent woke itself (ScheduleWakeup / background task
+      // completion / /loop) with no inbound to reply to. Deliver the FINAL
+      // answer to the configured fallback target(s); intermediate segments
+      // and tool calls are skipped (no live progress bubble off-channel).
+      await this.deliverOrphanOutput(session.channelKey, cleanText, stopReason);
       return;
     }
+    this.lastReplyTo.set(session.channelKey, replyTo);
     if (!cleanText && reactions.length === 0) return;
 
     // NO_REPLY: agent has decided this turn shouldn't surface anything on
@@ -1356,6 +1363,50 @@ class Daemon {
     }
 
     await this.applyReactions(replyTo, reactions);
+  }
+
+  /**
+   * Deliver the final answer of an orphan (self-woken / background) turn to
+   * the configured fallback target(s). Only acts on the end_turn segment, so
+   * the recipient gets the result, not a stream of intermediate fragments.
+   */
+  private async deliverOrphanOutput(
+    channelKey: string,
+    cleanText: string,
+    stopReason: string | undefined,
+  ): Promise<void> {
+    if (!cleanText || stopReason !== "end_turn") return;
+    if (isSilentReplyText(cleanText)) return;
+    const body = stripSilentToken(cleanText) || cleanText;
+    const targets = this.orphanTargets(channelKey);
+    if (targets.length === 0) {
+      console.log(`[daemon] [${channelKey}] orphan output, no fallback target — logging only:\n${body.slice(0, 500)}`);
+      return;
+    }
+    for (const t of targets) {
+      await this.platformSend(t, body);
+    }
+    console.log(`[daemon] [${channelKey}] orphan output delivered to ${targets.length} target(s)`);
+  }
+
+  /** Resolve fallback targets for orphan output per backgroundNotify.mode. */
+  private orphanTargets(channelKey: string): ReplyTarget[] {
+    const mode = this.settings.backgroundNotify.mode;
+    if (mode === "off") return [];
+    if (mode === "all") return this.allAuthenticatedDms();
+    // "last": the channel's last reply target, else the primary DM.
+    const last = this.lastReplyTo.get(channelKey);
+    if (last) return [last];
+    return this.allAuthenticatedDms().slice(0, 1);
+  }
+
+  /** Every authenticated DM as a reply target. Telegram allowedUserIds are
+   *  the addressable DMs; other platforms route DMs to global with no stored
+   *  per-user id, so they can't be broadcast to. */
+  private allAuthenticatedDms(): ReplyTarget[] {
+    return this.settings.telegram.allowedUserIds.map(
+      (chatId): ReplyTarget => ({ platform: "telegram", chatId }),
+    );
   }
 
   /**

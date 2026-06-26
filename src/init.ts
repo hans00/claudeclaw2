@@ -107,6 +107,10 @@ const SETTINGS_TEMPLATE = `{
     "allowedTools": [],
     "disallowedTools": [],
     "skipPermissions": false
+  },
+  "backgroundNotify": {
+    "//": "Where self-woken / background-task-completion output goes when there's no inbound to reply to. 'last' = the channel's last reply target (fallback: first authenticated DM); 'all' = every authenticated DM; 'off' = log only.",
+    "mode": "last"
   }
 }
 `;

@@ -212,6 +212,23 @@ export interface QueueConfig {
   dropPolicy: QueueDropPolicy;
 }
 
+/**
+ * Where to deliver "orphan" agent output — assistant text produced by a turn
+ * that has no reply target, i.e. the agent woke itself up (ScheduleWakeup /
+ * background-task completion / a /loop tick) rather than replying to an
+ * inbound message.
+ *
+ *   "last" — the channel's most recently used reply target, falling back to
+ *            the first authenticated DM if there isn't one yet (default)
+ *   "all"  — every authenticated DM (broadcast)
+ *   "off"  — log only, deliver nowhere (the old behaviour)
+ */
+export type BackgroundNotifyMode = "last" | "all" | "off";
+
+export interface BackgroundNotifyConfig {
+  mode: BackgroundNotifyMode;
+}
+
 export interface Settings {
   telegram: TelegramConfig;
   discord: DiscordConfig;
@@ -222,6 +239,8 @@ export interface Settings {
   sessionCleanup: SessionCleanupConfig;
   heartbeat: HeartbeatConfig;
   security: SecurityConfig;
+  /** Delivery of self-woken / background-completion output. */
+  backgroundNotify: BackgroundNotifyConfig;
   /** Default model (alias like "opus"/"sonnet" or full id). Empty = let Claude Code pick. */
   model: string;
   /** Per-turn model routing. When enabled, classifyTask picks a mode + model based on the user prompt. */
@@ -260,6 +279,7 @@ const DEFAULTS: Settings = {
   sessionCleanup: { idleTimeoutHours: 168, checkIntervalMinutes: 30 },
   heartbeat: { enabled: false, interval: 60, prompt: "", excludeWindows: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [], skipPermissions: false },
+  backgroundNotify: { mode: "last" },
   model: "",
   agentic: {
     enabled: false,
@@ -408,6 +428,11 @@ export async function loadSettings(): Promise<Settings> {
         ? raw.security.disallowedTools
         : [],
       skipPermissions: raw?.security?.skipPermissions === true,
+    },
+    backgroundNotify: {
+      mode: (["last", "all", "off"] as const).includes(raw?.backgroundNotify?.mode)
+        ? raw.backgroundNotify.mode
+        : DEFAULTS.backgroundNotify.mode,
     },
     heartbeat: {
       enabled: typeof raw?.heartbeat?.enabled === "boolean"
