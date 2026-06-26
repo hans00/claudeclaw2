@@ -876,7 +876,7 @@ class Daemon {
         await this.dispatchOutbound(channel.session, msg, replyTo);
         return true;
       }
-      const mins = Math.min(720, Math.max(1, Math.round(Number(arg) || 30)));
+      const mins = Math.min(720, Math.max(1, Math.round(Number(arg) || this.settings.approval.yoloMinutes)));
       this.autoApproveUntil.set(key, Date.now() + mins * 60_000);
       await this.dispatchOutbound(
         channel.session,
@@ -1492,12 +1492,16 @@ class Daemon {
       return;
     }
 
+    const yoloMin = cfg.yoloMinutes;
     const body = formatApprovalPrompt(session.channelKey, dialog);
     const buttons = (token: string) => {
       const rows = dialog.options.map((opt, i) => [{
         text: numberedButtonLabel(i + 1, opt),
         callback_data: `ap:${token}:${i + 1}`,
       }]);
+      // Yolo: approve now AND auto-approve everything on this channel for the
+      // next yoloMin minutes (so the operator can walk away). choice -1.
+      rows.push([{ text: `🚀 Yolo ${yoloMin}m (auto-approve)`, callback_data: `ap:${token}:-1` }]);
       rows.push([{ text: "❌ Cancel (Esc)", callback_data: `ap:${token}:0` }]);
       return rows;
     };
@@ -1515,6 +1519,12 @@ class Daemon {
           await api.cancel();
           this.promptForDenyReason(session, telegramChatId!);
           return "⏰ Timed out — denied";
+        }
+        if (choice === -1) {
+          // Yolo: approve this dialog + open an auto-approve window.
+          this.autoApproveUntil.set(session.channelKey, Date.now() + yoloMin * 60_000);
+          await api.selectOption(1);
+          return `🚀 Yolo by ${actor ?? "user"} — auto-approving for ${yoloMin}m`;
         }
         if (choice === 0) {
           await api.cancel();

@@ -113,9 +113,12 @@ export interface WebConfig {
 export interface ApprovalConfig {
   /** Master switch — when off, permission dialogs in tmux just hang. */
   enabled: boolean;
-  /** How long to wait for an operator response before auto-cancelling
+  /** How long to wait for an operator response before auto-denying
    *  (sending Esc to the tmux dialog). */
   timeoutSeconds: number;
+  /** Default duration (minutes) of the temporary auto-approve window opened
+   *  by the dialog's Yolo button and by `/autoapprove` with no argument. */
+  yoloMinutes: number;
   /**
    * Handling for Claude Code's periodic "How is Claude doing this session?"
    * feedback survey. The survey blocks the pane and produces no jsonl, so
@@ -253,7 +256,7 @@ const DEFAULTS: Settings = {
     allowedGroupIds: [],
   },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
-  approval: { enabled: true, timeoutSeconds: 300, survey: "dismiss" },
+  approval: { enabled: true, timeoutSeconds: 300, survey: "dismiss", yoloMinutes: 30 },
   sessionCleanup: { idleTimeoutHours: 168, checkIntervalMinutes: 30 },
   heartbeat: { enabled: false, interval: 60, prompt: "", excludeWindows: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [], skipPermissions: false },
@@ -394,6 +397,9 @@ export async function loadSettings(): Promise<Settings> {
         ? raw.approval.timeoutSeconds
         : DEFAULTS.approval.timeoutSeconds,
       survey: raw?.approval?.survey === "ask" ? "ask" : DEFAULTS.approval.survey,
+      yoloMinutes: typeof raw?.approval?.yoloMinutes === "number"
+        ? raw.approval.yoloMinutes
+        : DEFAULTS.approval.yoloMinutes,
     },
     security: {
       level: raw?.security?.level ?? DEFAULTS.security.level,
