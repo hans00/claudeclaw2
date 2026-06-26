@@ -101,6 +101,11 @@ const TYPING_PULSE_MS = 4000;
  *  jsonl event came in — covers UI-only commands like `/reload-plugins`. */
 const SLASH_IDLE_TIMEOUT_MS = 2000;
 
+/** Grace period after a tool rejection before synthesising turn-end — long
+ *  enough for the agent to start a continuation response (which cancels it),
+ *  short enough to unlock promptly when the agent just stops. */
+const DENY_RECOVERY_MS = 4000;
+
 /** Wait this long after the user picks a model-switch dialog option (or
  *  cancels) before synthesising turn-end. Long enough for the optional
  *  `Set model to ...` jsonl echo to land if "Yes" was picked; short enough
@@ -191,6 +196,19 @@ function encodeProjectDir(projectDir: string): string {
  *   - a live token counter ("↓ 1.4k tokens") — active generation
  *   - a running elapsed timer ≥1 minute ("(3m 37s …)") on the spinner/tool
  */
+/**
+ * Detect the text Claude Code writes when a tool permission is denied (via
+ * the dialog's "No" option or Esc). Both the is_error tool_result and the
+ * interrupt marker are matched.
+ */
+function isRejectionText(text: string): boolean {
+  return (
+    /doesn't want to proceed with this tool use/i.test(text) ||
+    /\buser rejected\b/i.test(text) ||
+    /Request interrupted by user for tool use/i.test(text)
+  );
+}
+
 function looksActivelyBusy(pane: string): boolean {
   return (
     /Running\b[^\n]*[…\.]/.test(pane) ||
@@ -317,6 +335,15 @@ export class Channel {
   private approvalTimer: ReturnType<typeof setInterval> | null = null;
   private stallTimer: ReturnType<typeof setTimeout> | null = null;
   private stallStartTime: number | null = null;
+  /**
+   * Fires a synthetic turn-end after a permission denial. When the operator
+   * (or anyone) rejects a tool, Claude Code records the rejection and — if it
+   * has nothing else to do — just STOPS without emitting an end_turn marker,
+   * leaving the channel stuck "running". This timer recovers that: armed on a
+   * rejection tool-result, cleared the moment any *assistant* event arrives
+   * (the agent is continuing, normal end_turn will handle it), and otherwise
+   * synthesises turn-end so the channel unlocks promptly. */
+  private denyRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
   /** Resolved by onJsonlEvent when the /model echo arrives. */
   private modelEchoResolve: (() => void) | null = null;
   /**
@@ -458,18 +485,23 @@ export class Channel {
       // Any activity resets the stall watchdog.
       this.resetStallTimer();
 
-      // Auto-wake detection: if we receive a fresh assistant event while
-      // the channel is idle, the agent has triggered itself (ScheduleWakeup,
-      // /loop self-pace, etc) without an inbound paste. Bump state so a
-      // concurrent user message doesn't race ahead with its own paste.
+      // An assistant event means the agent is actively producing output —
+      // including continuing AFTER a rejection. Cancel any pending deny
+      // recovery; the normal end_turn path will close the turn.
       if (
-        this.state === "idle" &&
-        (ev.type === "assistant-text" ||
-          ev.type === "assistant-tool-use" ||
-          ev.type === "assistant-thinking")
+        ev.type === "assistant-text" ||
+        ev.type === "assistant-tool-use" ||
+        ev.type === "assistant-thinking"
       ) {
-        this.state = "running";
-        this.startTypingPulse();
+        this.clearDenyRecoveryTimer();
+        // Auto-wake detection: a fresh assistant event while idle means the
+        // agent triggered itself (ScheduleWakeup, /loop self-pace, etc)
+        // without an inbound paste. Bump state so a concurrent user message
+        // doesn't race ahead with its own paste.
+        if (this.state === "idle") {
+          this.state = "running";
+          this.startTypingPulse();
+        }
       }
 
       switch (ev.type) {
@@ -497,9 +529,21 @@ export class Channel {
           if (ev.toolResult && this.opts.callbacks.onToolResult) {
             await this.opts.callbacks.onToolResult(ev.toolUseId, ev.toolResult, this.currentTurnReplyTo);
           }
+          // A rejected tool produces an is_error result like "The user
+          // doesn't want to proceed with this tool use." If the agent has
+          // nothing else to do it stops without an end_turn — arm recovery.
+          if (ev.toolResultIsError && isRejectionText(ev.toolResult ?? "")) {
+            this.armDenyRecoveryTimer();
+          }
           break;
         case "user-message": {
           if (!ev.userText) break;
+          // "[Request interrupted by user for tool use]" — the companion
+          // marker to a rejection. Same recovery.
+          if (isRejectionText(ev.userText)) {
+            this.armDenyRecoveryTimer();
+            break;
+          }
           const cls = classifyInternalOutput(ev.userText);
           if (cls.kind === "model-switch") {
             // /model switch echo: swallow when daemon initiated it (mid-turn,
@@ -635,6 +679,7 @@ export class Channel {
       this.interruptTimer = null;
     }
     this.clearSlashIdleTimer();
+    this.clearDenyRecoveryTimer();
     this.clearStallTimer();
     this.stopTypingPulse();
     this.stopApprovalPoll();
@@ -665,6 +710,28 @@ export class Channel {
     if (this.slashIdleTimer) {
       clearTimeout(this.slashIdleTimer);
       this.slashIdleTimer = null;
+    }
+  }
+
+  /** See denyRecoveryTimer field. Fires turn-end shortly after a rejection
+   *  unless an assistant event clears it first (agent continuing). */
+  private armDenyRecoveryTimer(): void {
+    this.clearDenyRecoveryTimer();
+    this.denyRecoveryTimer = setTimeout(() => {
+      this.denyRecoveryTimer = null;
+      if (this.state === "running") {
+        console.log(
+          `[channel ${this.opts.session.channelKey}] tool denied — agent idle after rejection, synthesising turn-end`,
+        );
+        this.onTurnEnd();
+      }
+    }, DENY_RECOVERY_MS);
+  }
+
+  private clearDenyRecoveryTimer(): void {
+    if (this.denyRecoveryTimer) {
+      clearTimeout(this.denyRecoveryTimer);
+      this.denyRecoveryTimer = null;
     }
   }
 
@@ -1230,6 +1297,7 @@ export class Channel {
     this.tailer = null;
     if (this.interruptTimer) { clearTimeout(this.interruptTimer); this.interruptTimer = null; }
     this.clearSlashIdleTimer();
+    this.clearDenyRecoveryTimer();
     this.clearStallTimer();
     this.stopTypingPulse();
     this.stopApprovalPoll();
@@ -1273,6 +1341,7 @@ export class Channel {
     if (this.interruptTimer) clearTimeout(this.interruptTimer);
     this.interruptTimer = null;
     this.clearSlashIdleTimer();
+    this.clearDenyRecoveryTimer();
     this.clearStallTimer();
     this.stopTypingPulse();
     this.stopApprovalPoll();

@@ -1513,21 +1513,42 @@ class Daemon {
       onResolve: async (choice, actor) => {
         if (choice === null) {
           await api.cancel();
-          return "⏰ _Timed out — cancelled_";
+          this.promptForDenyReason(session, telegramChatId!);
+          return "⏰ Timed out — denied";
         }
         if (choice === 0) {
           await api.cancel();
-          return `❌ _Cancelled by ${actor ?? "user"}_`;
+          this.promptForDenyReason(session, telegramChatId!);
+          return `❌ Denied by ${actor ?? "user"}`;
         }
         const label = dialog.options[choice - 1] ?? `option ${choice}`;
         await api.selectOption(choice);
-        return `✅ _Picked "${label}" by ${actor ?? "user"}_`;
+        // A "No"-type option is also a denial — the agent stops; offer to
+        // pass a reason back to it.
+        if (/^\s*no\b/i.test(label)) {
+          this.promptForDenyReason(session, telegramChatId!);
+          return `❌ Denied by ${actor ?? "user"}`;
+        }
+        return `✅ Approved "${label}" by ${actor ?? "user"}`;
       },
     });
     if (!registered) {
       console.warn(`[approval] failed to register for ${session.channelKey} — auto-cancelling`);
       await api.cancel();
     }
+  }
+
+  /**
+   * After a denial, nudge the operator to explain why. The channel unlocks
+   * itself (channel.ts deny-recovery), so any reply the operator sends next
+   * lands as a fresh prompt the agent reads in the context of the rejection
+   * it just saw — no special capture needed. Fire-and-forget.
+   */
+  private promptForDenyReason(_session: ChannelSession, chatId: number): void {
+    void this.telegram?.sendMessage(
+      chatId,
+      "↩️ Denied. Reply with a reason or what to do instead — it'll be sent to the agent as your next message. Ignore to just stop.",
+    ).catch(() => {});
   }
 
   /**
