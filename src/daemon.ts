@@ -75,11 +75,6 @@ class Daemon {
    *  carries its own onResolve closure so the daemon doesn't need to know
    *  the kind-specific logic here. */
   private pendingInteractions = new Map<string, PendingInteraction>();
-  /** Per-channel temporary auto-approve deadline (epoch ms). While now <
-   *  this value, permission/model-switch dialogs on that channel are
-   *  auto-approved (select option 1) instead of prompting. Set via
-   *  /autoapprove. */
-  private autoApproveUntil = new Map<string, number>();
   /** Per-channel most-recently-used reply target. Drives backgroundNotify
    *  "last" mode so self-woken / background-completion output goes back to
    *  wherever the channel last communicated. */
@@ -859,36 +854,6 @@ class Daemon {
       }
       return true;
     }
-    // /autoapprove [minutes|off] — temporarily auto-approve permission +
-    // model-switch dialogs on this channel so the operator doesn't have to
-    // watch. Default 30 min. `off` cancels.
-    const autoMatch = cmd.match(/^\/(?:claudeclaw2:)?(?:autoapprove|yolo)(?:\s+(.+))?$/);
-    if (autoMatch) {
-      const arg = autoMatch[1]?.trim().toLowerCase();
-      const key = channel.session.channelKey;
-      if (arg === "off" || arg === "0" || arg === "stop") {
-        this.autoApproveUntil.delete(key);
-        await this.dispatchOutbound(channel.session, "🔒 Auto-approve off — dialogs will ask again", replyTo);
-        return true;
-      }
-      if (!arg) {
-        const until = this.autoApproveUntil.get(key) ?? 0;
-        const remainMin = Math.max(0, Math.round((until - Date.now()) / 60000));
-        const msg = remainMin > 0
-          ? `🟢 Auto-approve ON — ${remainMin} min left. \`/autoapprove off\` to stop.`
-          : "🔒 Auto-approve off. `/autoapprove <minutes>` to enable (default 30).";
-        await this.dispatchOutbound(channel.session, msg, replyTo);
-        return true;
-      }
-      const mins = Math.min(720, Math.max(1, Math.round(Number(arg) || this.settings.approval.yoloMinutes)));
-      this.autoApproveUntil.set(key, Date.now() + mins * 60_000);
-      await this.dispatchOutbound(
-        channel.session,
-        `🟢 Auto-approving all dialogs on this channel for ${mins} min. \`/autoapprove off\` to stop early.`,
-        replyTo,
-      );
-      return true;
-    }
     // /reset — hard reset: respawn the agent on a fresh session UUID. Always
     // a clean slate; session tracking stays correct because we own the id.
     if (cmd === "/reset" || cmd === "/claudeclaw2:reset") {
@@ -1502,19 +1467,6 @@ class Daemon {
       return;
     }
 
-    // Temporary auto-approve window (set via /autoapprove). While active for
-    // this channel, approve permission/model-switch dialogs by selecting the
-    // first (proceed) option without bothering the operator. Surveys still
-    // follow the survey setting below.
-    if (dialog.kind !== "survey") {
-      const until = this.autoApproveUntil.get(session.channelKey) ?? 0;
-      if (Date.now() < until) {
-        console.log(`[approval] auto-approving (window active) on ${session.channelKey}`);
-        await api.selectOption(1);
-        return;
-      }
-    }
-
     // Survey auto-dismiss: settings.approval.survey === "dismiss" makes the
     // periodic "How is Claude doing?" prompt vanish silently so the channel
     // doesn't stall on it. "ask" falls through to the normal operator path.
@@ -1543,16 +1495,12 @@ class Daemon {
       return;
     }
 
-    const yoloMin = cfg.yoloMinutes;
     const body = formatApprovalPrompt(session.channelKey, dialog);
     const buttons = (token: string) => {
       const rows = dialog.options.map((opt, i) => [{
         text: numberedButtonLabel(i + 1, opt),
         callback_data: `ap:${token}:${i + 1}`,
       }]);
-      // Yolo: approve now AND auto-approve everything on this channel for the
-      // next yoloMin minutes (so the operator can walk away). choice -1.
-      rows.push([{ text: `🚀 Yolo ${yoloMin}m (auto-approve)`, callback_data: `ap:${token}:-1` }]);
       rows.push([{ text: "❌ Cancel (Esc)", callback_data: `ap:${token}:0` }]);
       return rows;
     };
@@ -1570,12 +1518,6 @@ class Daemon {
           await api.cancel();
           this.promptForDenyReason(session, telegramChatId!);
           return "⏰ Timed out — denied";
-        }
-        if (choice === -1) {
-          // Yolo: approve this dialog + open an auto-approve window.
-          this.autoApproveUntil.set(session.channelKey, Date.now() + yoloMin * 60_000);
-          await api.selectOption(1);
-          return `🚀 Yolo by ${actor ?? "user"} — auto-approving for ${yoloMin}m`;
         }
         if (choice === 0) {
           await api.cancel();

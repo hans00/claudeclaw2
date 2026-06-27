@@ -64,7 +64,6 @@ const BUILTIN_COMMANDS: SlashCommandDef[] = [
 const SESSION_COMMANDS: SlashCommandDef[] = [
   { name: "clear", originalName: "clear", description: "Clear context (keeps the session warm)" },
   { name: "reset", originalName: "reset", description: "Hard reset — fresh session on a new id" },
-  { name: "autoapprove", originalName: "autoapprove", description: "Temporarily auto-approve all dialogs (e.g. /autoapprove 30)" },
 ];
 
 export async function discoverCommands(): Promise<SlashCommandDef[]> {

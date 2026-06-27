@@ -140,6 +140,12 @@ export function buildSecurityArgs(security: SecurityConfig): string[] {
       args.push("--disallowedTools", "Bash,WebSearch,WebFetch");
       break;
     case "moderate":
+      // Claude Code's native "auto" permission mode — auto-approves routine
+      // operations, prompts only for the riskier ones (which the daemon then
+      // forwards to the operator). Replaces the old manual yolo window.
+      // Skipped when skipPermissions is on (that already bypasses everything).
+      if (!security.skipPermissions) args.push("--permission-mode", "auto");
+      break;
     case "unrestricted":
       break;
   }

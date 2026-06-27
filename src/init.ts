@@ -95,11 +95,10 @@ const SETTINGS_TEMPLATE = `{
     "checkIntervalMinutes": 30
   },
   "approval": {
-    "//": "When the agent hits a permission dialog it can't auto-resolve, ask the operator via Telegram inline buttons. Decision sent into tmux as keystrokes. Auto-deny after timeoutSeconds. survey: 'dismiss' auto-presses Dismiss on the periodic 'How is Claude doing?' prompt; 'ask' surfaces it. yoloMinutes: how long the dialog's Yolo button (and /autoapprove with no arg) auto-approves for.",
+    "//": "When the agent hits a permission dialog it can't auto-resolve, ask the operator via Telegram inline buttons. Decision sent into tmux as keystrokes. Auto-deny after timeoutSeconds. survey: 'dismiss' auto-presses Dismiss on the periodic 'How is Claude doing?' prompt; 'ask' surfaces it.",
     "enabled": true,
     "timeoutSeconds": 300,
-    "survey": "dismiss",
-    "yoloMinutes": 30
+    "survey": "dismiss"
   },
   "security": {
     "//": "skipPermissions: true adds --dangerously-skip-permissions (auto-approve every tool, no prompts). Off by default — when off, claude keeps its normal permission prompts and the daemon forwards them to your DM for approval.",
