@@ -12,11 +12,17 @@
  */
 export const SILENT_REPLY_TOKEN = "NO_REPLY";
 
+/**
+ * Whole-message sentinels that mean "produce nothing visible on the
+ * platform". NO_REPLY = multi-party silence; HEARTBEAT_OK = the heartbeat
+ * found nothing worth saying. Both must be suppressed, never delivered.
+ */
+const SILENT_SENTINELS = [SILENT_REPLY_TOKEN, "HEARTBEAT_OK"];
+
 const WRAP_CHARS = "`\"'*_~";
 const END_PUNCT = ".!?;:。！？；：,，"; // CJK punctuation intentional — matches CJK-language replies
 const LEAD_RE = new RegExp(`^[${WRAP_CHARS}\\s]+`);
 const TAIL_RE = new RegExp(`[${WRAP_CHARS}${END_PUNCT}\\s]+$`);
-const EXACT_RE = /^\s*NO_REPLY\s*$/;
 const TRAILING_RE = new RegExp(
   `\\s*[${WRAP_CHARS}]*NO_REPLY[${WRAP_CHARS}${END_PUNCT}\\s]*$`,
 );
@@ -30,11 +36,13 @@ function normalizeSilent(text: string): string {
   return t.replace(LEAD_RE, "").replace(TAIL_RE, "");
 }
 
-/** True when the entire text is the silent marker (tolerating wrappers). */
+/** True when the entire text is a silent sentinel (tolerating wrappers). */
 export function isSilentReplyText(text: string): boolean {
   if (!text) return false;
-  if (EXACT_RE.test(text)) return true;
-  return normalizeSilent(text) === SILENT_REPLY_TOKEN;
+  const norm = normalizeSilent(text);
+  return SILENT_SENTINELS.some(
+    (s) => norm === s || new RegExp(`^\\s*${s}\\s*$`).test(text),
+  );
 }
 
 /** Remove a trailing NO_REPLY marker (with optional wrappers/punct). */
