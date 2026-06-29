@@ -6,7 +6,7 @@
  * existing sessions on startup so daemon restarts don't reset conversations.
  */
 import { randomUUID } from "crypto";
-import { watch } from "fs";
+import { existsSync, statSync, writeFileSync } from "fs";
 import { mkdir, readFile, unlink, writeFile } from "fs/promises";
 import { discoverCommands, type SlashCommandDef } from "./slash-commands";
 import { dirname, join } from "path";
@@ -132,19 +132,25 @@ class Daemon {
    * Also responds to SIGHUP — installed in installSignalHandlers().
    */
   private watchSettings(): void {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    try {
-      watch(SETTINGS_PATH, () => {
-        if (timer) clearTimeout(timer);
-        timer = setTimeout(() => {
-          timer = null;
-          void this.reloadSettings("file change");
-        }, 200);
-      });
-      console.log("[daemon] watching settings.json for changes");
-    } catch (err) {
-      console.warn("[daemon] could not watch settings.json:", err);
-    }
+    // Poll the file's mtime rather than fs.watch. Two fs.watch dead-ends:
+    //   - watching the FILE misses atomic-rename saves entirely (vim/vscode
+    //     write a temp file then rename over the target; no event fires on
+    //     the old inode)
+    //   - watching the DIRECTORY makes Bun choke opening the daemon.sock unix
+    //     socket that lives alongside (ENXIO crash)
+    // Polling mtime catches in-place writes AND renames, with no socket
+    // hazard. 2s cadence; SIGHUP is available for instant reloads.
+    let lastMtime = 0;
+    try { lastMtime = statSync(SETTINGS_PATH).mtimeMs; } catch {}
+    setInterval(() => {
+      let m: number;
+      try { m = statSync(SETTINGS_PATH).mtimeMs; } catch { return; }
+      if (m !== lastMtime) {
+        lastMtime = m;
+        void this.reloadSettings("file change");
+      }
+    }, 2000);
+    console.log("[daemon] watching settings.json for changes (poll)");
   }
 
   /**
@@ -230,18 +236,53 @@ class Daemon {
       triggerJob: (name) => this.triggerJobByName(name),
       sendToPlatform: (target, text) => this.sendToPlatform(target, text),
       inboxOwnerForTarget: (target) => inboxOwnerForTarget(target),
-      restartDaemon: (ctx) => {
-        console.log("[daemon] restart requested via API", ctx?.reason ? `(reason: ${ctx.reason})` : "");
-        if (ctx?.reason || ctx?.replyTo) {
-          void writeFile(RESTART_PENDING_PATH, JSON.stringify({ ...ctx, timestamp: new Date().toISOString() }));
-        }
-        setTimeout(() => this.shutdown("api-restart", 75), 150);
-      },
+      restartDaemon: (ctx) => this.triggerRestart(ctx),
     };
     this.web = new WebServer(this.settings.web, view, this.authToken);
     this.web.start();
     const sockPath = join(this.projectDir, ".claude", "claudeclaw", "daemon.sock");
     await this.web.startIpc(sockPath);
+  }
+
+  /**
+   * Restart the daemon. There's no external supervisor (start.sh launches us
+   * with a bare `nohup bun run … &`), so exiting alone wouldn't come back.
+   * Instead we re-exec start.sh detached — it stops this process and launches
+   * a fresh daemon (sessions resume from sessions.json). Falls back to exit 75
+   * for setups that DO run a supervisor watching that code.
+   *
+   * ctx (reason / replyTo) is persisted so the new daemon can confirm back to
+   * the requester once it's up (checkRestartContext).
+   */
+  private triggerRestart(ctx?: { reason?: string; replyTo?: string }): void {
+    console.log("[daemon] restart requested", ctx?.reason ? `(reason: ${ctx.reason})` : "");
+    if (ctx?.reason || ctx?.replyTo) {
+      try {
+        writeFileSync(RESTART_PENDING_PATH, JSON.stringify({ ...ctx, timestamp: new Date().toISOString() }));
+      } catch (err) {
+        console.error("[daemon] could not write restart-pending:", err);
+      }
+    }
+    const startSh = join(this.projectDir, "start.sh");
+    if (existsSync(startSh)) {
+      // setsid → new session so the relauncher survives our exit. start.sh
+      // stops us (pidfile/pkill) then launches a fresh daemon.
+      try {
+        Bun.spawn(["setsid", "bash", startSh], {
+          cwd: this.projectDir,
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+          env: process.env,
+        }).unref();
+        console.log("[daemon] re-exec via start.sh; exiting");
+        setTimeout(() => process.exit(0), 300);
+        return;
+      } catch (err) {
+        console.error("[daemon] start.sh re-exec failed, falling back to exit 75:", err);
+      }
+    }
+    setTimeout(() => this.shutdown("restart", 75), 150);
   }
 
   private async loadOrCreateAuthToken(): Promise<string> {
@@ -852,6 +893,13 @@ class Daemon {
           replyTo,
         );
       }
+      return true;
+    }
+    // /restart — restart the whole daemon (re-exec via start.sh). The new
+    // daemon confirms back to this chat once it's up.
+    if (cmd === "/restart" || cmd === "/claudeclaw2:restart") {
+      await this.dispatchOutbound(channel.session, "♻️ Restarting daemon… back in a moment.", replyTo);
+      this.triggerRestart({ reason: "/restart command", replyTo: stringifyReplyTo(replyTo) });
       return true;
     }
     // /reset — hard reset: respawn the agent on a fresh session UUID. Always
@@ -2192,6 +2240,17 @@ function inboxOwnerForTarget(target: string): string | null {
     return target;
   }
   return null;
+}
+
+/** Serialize a ReplyTarget back to the "platform:id[:thread]" string form
+ *  used by restart-pending.json (inverse of parseReplyToFromString). */
+function stringifyReplyTo(r: ReplyTarget): string | undefined {
+  if (!r) return undefined;
+  if (r.platform === "telegram") return `telegram:${r.chatId}`;
+  if (r.platform === "discord") return `discord:${r.channelId}`;
+  if (r.platform === "slack") return r.threadTs ? `slack:${r.channelId}:${r.threadTs}` : `slack:${r.channelId}`;
+  if (r.platform === "line") return `line:${r.to}`;
+  return undefined;
 }
 
 function parseReplyToFromString(target: string): ReplyTarget {

@@ -64,6 +64,7 @@ const BUILTIN_COMMANDS: SlashCommandDef[] = [
 const SESSION_COMMANDS: SlashCommandDef[] = [
   { name: "clear", originalName: "clear", description: "Clear context (keeps the session warm)" },
   { name: "reset", originalName: "reset", description: "Hard reset — fresh session on a new id" },
+  { name: "restart", originalName: "restart", description: "Restart the whole ClaudeClaw daemon" },
 ];
 
 export async function discoverCommands(): Promise<SlashCommandDef[]> {
