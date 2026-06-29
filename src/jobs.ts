@@ -191,6 +191,15 @@ export async function deleteJob(name: string): Promise<boolean> {
   }
 }
 
+/**
+ * Filenames we've already warned about for an absent schedule. loadJobs runs
+ * every cron tick (~60s), so without this a stray non-job markdown left in
+ * the jobs dir would log the same warning every minute forever. Warn once per
+ * file; clear the flag when the file later parses as a valid job so a
+ * genuinely-broken job that gets fixed-then-rebroken still re-warns.
+ */
+const warnedBadJobs = new Set<string>();
+
 export async function loadJobs(): Promise<Job[]> {
   let files: string[];
   try {
@@ -212,9 +221,13 @@ export async function loadJobs(): Promise<Job[]> {
     }
     const { meta, body } = parseFrontmatter(content);
     if (!meta.schedule) {
-      console.warn(`[jobs] ${name}: missing 'schedule' field — skipping`);
+      if (!warnedBadJobs.has(name)) {
+        console.warn(`[jobs] ${name}: missing 'schedule' field — skipping`);
+        warnedBadJobs.add(name);
+      }
       continue;
     }
+    warnedBadJobs.delete(name);
     const job: Job = {
       name: basename(name, ".md"),
       filePath,
