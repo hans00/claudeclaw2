@@ -49,11 +49,12 @@ const DAEMON_COMMANDS: SlashCommandDef[] = [
  * Multi-word commands use _ as separator; daemon maps them back before forwarding.
  */
 const BUILTIN_COMMANDS: SlashCommandDef[] = [
-  { name: "compact",        originalName: "compact",        description: "Compact conversation context" },
-  { name: "context",        originalName: "context",        description: "Show current context window usage" },
-  { name: "cost",           originalName: "cost",           description: "Show token usage and cost for this session" },
-  { name: "doctor",         originalName: "doctor",         description: "Check Claude Code setup and configuration" },
-  { name: "plugin_reload",  originalName: "plugin reload",  description: "Reload all plugins without restarting" },
+  { name: "compact",         originalName: "compact",         description: "Compact conversation context" },
+  { name: "context",         originalName: "context",         description: "Show current context window usage" },
+  { name: "cost",            originalName: "cost",            description: "Show token usage and cost for this session" },
+  { name: "doctor",          originalName: "doctor",          description: "Check Claude Code setup and configuration" },
+  { name: "reload_plugins",  originalName: "reload-plugins",  description: "Reload all plugins without restarting" },
+  { name: "reload_skills",   originalName: "reload-skills",   description: "Reload all skills without restarting" },
 ];
 
 /**
