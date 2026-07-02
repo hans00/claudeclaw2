@@ -478,21 +478,23 @@ export class Channel {
 
   private async onJsonlEvent(ev: JsonlEvent): Promise<void> {
     try {
-      // Any real jsonl event means the slash command did produce output —
-      // cancel the UI-only-slash fallback so its normal handler (classifier
-      // path or end_turn) takes care of the turn-end.
-      this.clearSlashIdleTimer();
       // Any activity resets the stall watchdog.
       this.resetStallTimer();
 
       // An assistant event means the agent is actively producing output —
-      // including continuing AFTER a rejection. Cancel any pending deny
-      // recovery; the normal end_turn path will close the turn.
+      // i.e. a REAL turn has started (not just a UI-only slash command).
       if (
         ev.type === "assistant-text" ||
         ev.type === "assistant-tool-use" ||
         ev.type === "assistant-thinking"
       ) {
+        // A real turn is underway — the normal end_turn path will close it,
+        // so cancel the UI-only-slash fallback. (Do NOT cancel it on plain
+        // system/user events: UI-only commands like /reload-skills emit a
+        // `system: local_command` + user rows but never an end_turn, and
+        // cancelling here would leave the channel stuck "running" forever.)
+        this.clearSlashIdleTimer();
+        // Continuing after a rejection also counts — cancel deny recovery.
         this.clearDenyRecoveryTimer();
         // Auto-wake detection: a fresh assistant event while idle means the
         // agent triggered itself (ScheduleWakeup, /loop self-pace, etc)
