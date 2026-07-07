@@ -605,6 +605,20 @@ export class Channel {
       this.activeApprovalFp = null;
       return;
     }
+    // "Switch model?" confirmations are system decisions, never the operator's
+    // — always proceed. If maybeSwitchModel is mid-switch (expectingModelEcho)
+    // it owns the confirm, so leave it alone; otherwise auto-confirm here
+    // (cursor is on "Yes, switch") rather than pestering the operator.
+    if (dialog.kind === "model-switch") {
+      if (this.expectingModelEcho) return;
+      if (dialog.fingerprint === this.activeApprovalFp) return;
+      this.activeApprovalFp = dialog.fingerprint;
+      this.clearSlashIdleTimer();
+      console.log(`[channel ${this.opts.session.channelKey}] auto-confirming Switch model? dialog`);
+      await pressEnter(this.opts.session.tmuxSession);
+      this.activeApprovalFp = null;
+      return;
+    }
     if (dialog.fingerprint === this.activeApprovalFp) return; // already raised
     this.activeApprovalFp = dialog.fingerprint;
     // A dialog is up: the slash command DID produce output (a TUI dialog),
@@ -1008,6 +1022,34 @@ export class Channel {
   }
 
   /**
+   * After issuing a model change (typed `/model` or the picker `s`), wait for
+   * it to take effect while auto-confirming Claude Code's "Switch model?"
+   * cache-invalidation dialog if it appears. That dialog blocks with no jsonl
+   * echo, so without confirming it the caller would time out and (in
+   * maybeSwitchModel) paste the user prompt on top of the dialog — the stall
+   * Hans hit. System-initiated switches always proceed (cursor sits on "1.
+   * Yes, switch"). Polls until the echo resolves or the timeout.
+   */
+  private async awaitModelSwitch(echoReady: Promise<void>): Promise<void> {
+    const target = this.opts.session.tmuxSession;
+    let echoDone = false;
+    void echoReady.then(() => { echoDone = true; });
+    let confirmed = false;
+    const deadline = Date.now() + MODEL_ECHO_TIMEOUT_MS;
+    while (!echoDone && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 200));
+      if (echoDone || confirmed) continue;
+      try {
+        const dialog = parsePermissionDialog(await capturePane(target));
+        if (dialog?.kind === "model-switch") {
+          await pressEnter(target); // confirm option 1 (Yes, switch)
+          confirmed = true;
+        }
+      } catch {}
+    }
+  }
+
+  /**
    * If agentic routing is enabled, classify the next prompt and send
    * `/model <name>` to the tmux session when the routed model differs
    * from what the channel last left the session on. The slash command
@@ -1086,10 +1128,7 @@ export class Channel {
       await sendKeys(target, `/model ${routed.model}`);
       await new Promise((r) => setTimeout(r, 150));
       await pressEnter(target);
-      // Wait for the tool-call response (the "Set model to …" stdout event)
-      // to land in the jsonl before pasting the user prompt. Falls back to a
-      // hard timeout so a missed echo doesn't deadlock the channel.
-      await Promise.race([echoReady, new Promise((r) => setTimeout(r, MODEL_ECHO_TIMEOUT_MS))]);
+      await this.awaitModelSwitch(echoReady);
       this.modelEchoResolve = null;
       // Give the TUI a moment to clear the input box after the echo.
       await new Promise((r) => setTimeout(r, 300));
@@ -1141,7 +1180,7 @@ export class Channel {
       await sendKeys(target, `/model ${model}`);
       await new Promise((r) => setTimeout(r, 150));
       await pressEnter(target);
-      await Promise.race([echoReady, new Promise((r) => setTimeout(r, MODEL_ECHO_TIMEOUT_MS))]);
+      await this.awaitModelSwitch(echoReady);
       this.modelEchoResolve = null;
       await new Promise((r) => setTimeout(r, 300));
       this.currentModel = model;
@@ -1207,6 +1246,9 @@ export class Channel {
     const target = this.opts.session.tmuxSession;
     try {
       this.expectingModelEcho = true;
+      const echoReady = new Promise<void>((r) => {
+        this.modelEchoResolve = r;
+      });
       await pasteText(target, "/model");
       await new Promise((r) => setTimeout(r, 200));
       await pressEnter(target);
@@ -1217,6 +1259,7 @@ export class Channel {
       if (!targetOpt || cursor === undefined || options.length === 0) {
         await pressEscape(target);
         this.expectingModelEcho = false;
+        this.modelEchoResolve = null;
         return { ok: false };
       }
       const n = options.length;
@@ -1227,7 +1270,9 @@ export class Channel {
       }
       // `s` = apply for this session only (leaves the global default alone).
       await sendKeys(target, "s");
-      await new Promise((r) => setTimeout(r, 400));
+      // Switching to a different model with active cache pops the "Switch
+      // model?" confirmation even from the picker — auto-confirm it.
+      await this.awaitModelSwitch(echoReady);
       this.expectingModelEcho = false;
       this.modelEchoResolve = null;
       // Record state for hysteresis. We don't have the canonical model id
