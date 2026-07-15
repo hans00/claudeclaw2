@@ -20,7 +20,7 @@
  *     parser. Caller decides whether to auto-dismiss (digit "0") or forward.
  */
 
-export type DialogKind = "permission" | "model-switch" | "survey";
+export type DialogKind = "permission" | "model-switch" | "survey" | "question";
 
 export interface PermissionDialog {
   kind: DialogKind;
@@ -111,8 +111,49 @@ function parseBlockDialog(pane: string): PermissionDialog | null {
   };
 }
 
+/**
+ * Claude Code's AskUserQuestion menu. Unlike a permission dialog, each option
+ * carries a multi-line description, and the footer reads "Enter to select ·
+ * ↑/↓ to navigate · Esc to cancel". parseBlockDialog can't parse it (the
+ * description lines break its consecutive-`N.` capture), so it needs its own
+ * parser. Options are answered by (N-1) Down + Enter, same as a block dialog.
+ */
+const QUESTION_OPTION_RE = /^\s{0,3}(?:❯\s+)?(\d+)\.\s+(.+?)\s*$/;
+
+function parseQuestionDialog(pane: string): PermissionDialog | null {
+  if (!/Enter to select/.test(pane)) return null;
+  if (!/(?:↑\/↓|to navigate)/.test(pane)) return null;
+  const lines = pane.split("\n");
+  const options: string[] = [];
+  let firstOptLine = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(QUESTION_OPTION_RE);
+    if (m) {
+      if (firstOptLine < 0) firstOptLine = i;
+      options.push(m[2].trim());
+    }
+  }
+  if (options.length < 2) return null;
+  // Question = the non-empty lines just above the first option, back to a
+  // separator rule (strips the leading ☐ header marker).
+  const ctx: string[] = [];
+  for (let i = firstOptLine - 1; i >= 0 && ctx.length < 8; i--) {
+    const t = lines[i].trim();
+    if (!t) continue;
+    if (/^[─▔╌—_-]{3,}$/.test(t)) break;
+    ctx.unshift(t.replace(/^☐\s*/, ""));
+  }
+  const question = ctx.join("\n").trim();
+  return {
+    kind: "question",
+    question,
+    options,
+    fingerprint: fingerprint(`question:${question}\n${options.join("|")}`),
+  };
+}
+
 export function parsePermissionDialog(pane: string): PermissionDialog | null {
-  return parseSurvey(pane) ?? parseBlockDialog(pane);
+  return parseSurvey(pane) ?? parseQuestionDialog(pane) ?? parseBlockDialog(pane);
 }
 
 /**

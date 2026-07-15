@@ -1543,13 +1543,21 @@ class Daemon {
       return;
     }
 
+    const isQuestion = dialog.kind === "question";
     const body = formatApprovalPrompt(session.channelKey, dialog);
     const buttons = (token: string) => {
-      const rows = dialog.options.map((opt, i) => [{
-        text: numberedButtonLabel(i + 1, opt),
-        callback_data: `ap:${token}:${i + 1}`,
-      }]);
-      rows.push([{ text: "❌ Cancel (Esc)", callback_data: `ap:${token}:0` }]);
+      // Keep the real 1-based menu index in callback_data (navigation is
+      // (index-1) Down + Enter). For AskUserQuestion menus, hide the two
+      // meta escape-hatches — "Type something." opens a text box we can't
+      // fill from a button, and "Chat about this" == just Esc/dismiss.
+      const rows = dialog.options
+        .map((opt, i) => ({ opt, index: i + 1 }))
+        .filter(({ opt }) => !isQuestion || !/^(type something\.?|chat about this)$/i.test(opt))
+        .map(({ opt, index }) => [{
+          text: numberedButtonLabel(index, opt),
+          callback_data: `ap:${token}:${index}`,
+        }]);
+      rows.push([{ text: isQuestion ? "✖️ Dismiss (Esc)" : "❌ Cancel (Esc)", callback_data: `ap:${token}:0` }]);
       return rows;
     };
 
@@ -1564,18 +1572,19 @@ class Daemon {
       onResolve: async (choice, actor) => {
         if (choice === null) {
           await api.cancel();
-          this.promptForDenyReason(session, telegramChatId!);
-          return "⏰ Timed out — denied";
+          if (dialog.kind === "permission") this.promptForDenyReason(session, telegramChatId!);
+          return isQuestion ? "⏰ Timed out — dismissed" : "⏰ Timed out — denied";
         }
         if (choice === 0) {
           await api.cancel();
-          this.promptForDenyReason(session, telegramChatId!);
-          return `❌ Denied by ${actor ?? "user"}`;
+          if (dialog.kind === "permission") this.promptForDenyReason(session, telegramChatId!);
+          return isQuestion ? `✖️ Dismissed by ${actor ?? "user"}` : `❌ Denied by ${actor ?? "user"}`;
         }
         const label = dialog.options[choice - 1] ?? `option ${choice}`;
         await api.selectOption(choice);
-        // A "No"-type option is also a denial — the agent stops; offer to
-        // pass a reason back to it.
+        if (isQuestion) return `✅ Answered "${label}" by ${actor ?? "user"}`;
+        // A "No"-type permission option is a denial — the agent stops; offer
+        // to pass a reason back to it.
         if (/^\s*no\b/i.test(label)) {
           this.promptForDenyReason(session, telegramChatId!);
           return `❌ Denied by ${actor ?? "user"}`;
@@ -2039,6 +2048,9 @@ function formatApprovalPrompt(channelKey: string, dialog: PermissionDialog): str
       break;
     case "survey":
       header = `📋 _How is Claude doing this session?_ · \`${channelKey}\``;
+      break;
+    case "question":
+      header = `❓ _The agent is asking_ · \`${channelKey}\``;
       break;
     case "permission":
     default:
