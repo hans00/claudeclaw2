@@ -123,6 +123,11 @@ const STALL_MAX_MS = 600_000;
 const BUSY_HARD_CAP_MS = 1_800_000; // 30 min
 /** How long to wait for the /model echo before giving up and proceeding. */
 const MODEL_ECHO_TIMEOUT_MS = 3_000;
+/** Max consecutive auto-retries when a turn dies to a transient server error
+ *  (rate limit / overload). Each retry is spaced ~one stall interval apart,
+ *  which doubles as backoff; after this we give up and return to idle so the
+ *  operator can retry manually. */
+const MAX_RATE_LIMIT_RETRIES = 3;
 
 export interface SourceInfo {
   platform: "telegram" | "discord" | "slack" | "line";
@@ -207,6 +212,18 @@ function isRejectionText(text: string): boolean {
     /\buser rejected\b/i.test(text) ||
     /Request interrupted by user for tool use/i.test(text)
   );
+}
+
+/**
+ * Detect a transient, retryable server-side API error surfaced in the pane —
+ * rate limiting, overload, 429/503/529, "try again". Excludes the user's own
+ * usage-limit (that's not retryable) via the "not your usage limit" wording
+ * Claude Code uses. Requires an "API Error" line so ordinary text mentioning
+ * these words doesn't trip it.
+ */
+function isRecoverableApiError(pane: string): boolean {
+  if (!/API Error/i.test(pane)) return false;
+  return /(temporarily limiting requests|rate limited|overloaded|too many requests|\b429\b|\b503\b|\b529\b|try again in a moment)/i.test(pane);
 }
 
 function looksActivelyBusy(pane: string): boolean {
@@ -335,6 +352,10 @@ export class Channel {
   private approvalTimer: ReturnType<typeof setInterval> | null = null;
   private stallTimer: ReturnType<typeof setTimeout> | null = null;
   private stallStartTime: number | null = null;
+  /** Consecutive transient-API-error (rate-limit / overloaded) auto-retries
+   *  on the current turn. Bounded by MAX_RATE_LIMIT_RETRIES; reset to 0 the
+   *  moment the agent produces any assistant output (the error cleared). */
+  private rateLimitRetries = 0;
   /**
    * Fires a synthetic turn-end after a permission denial. When the operator
    * (or anyone) rejects a tool, Claude Code records the rejection and — if it
@@ -496,6 +517,8 @@ export class Channel {
         this.clearSlashIdleTimer();
         // Continuing after a rejection also counts — cancel deny recovery.
         this.clearDenyRecoveryTimer();
+        // Agent is producing output → any transient API error has cleared.
+        this.rateLimitRetries = 0;
         // Auto-wake detection: a fresh assistant event while idle means the
         // agent triggered itself (ScheduleWakeup, /loop self-pace, etc)
         // without an inbound paste. Bump state so a concurrent user message
@@ -791,6 +814,30 @@ export class Channel {
     // that keeps showing a stale "busy" line forever.
     if (stallMs < BUSY_HARD_CAP_MS && (this.activeApprovalFp || looksActivelyBusy(pane))) {
       this.stallTimer = setTimeout(() => void this.onStall(), 60_000);
+      return;
+    }
+
+    // Transient server error (rate limit / overload) killed the turn mid-way:
+    // Claude Code gives up after its own retries and returns to the prompt,
+    // but emits no end_turn — so the turn's work is abandoned. Auto-recover by
+    // nudging the agent to continue (bounded; the ~stall interval is backoff).
+    if (isRecoverableApiError(pane)) {
+      const replyTo = this.currentTurnReplyTo;
+      this.onTurnEnd(); // unstick to idle first
+      if (this.rateLimitRetries >= MAX_RATE_LIMIT_RETRIES) {
+        console.warn(`[channel ${key}] transient API error — auto-retry exhausted (${this.rateLimitRetries}); back to idle`);
+        this.rateLimitRetries = 0;
+        return;
+      }
+      this.rateLimitRetries++;
+      console.warn(`[channel ${key}] transient API error mid-turn — auto-retry ${this.rateLimitRetries}/${MAX_RATE_LIMIT_RETRIES}`);
+      await this.handleIncoming({
+        text: "The previous response was interrupted by a temporary server rate limit / overload (not a usage limit). Please continue exactly where you left off.",
+        fromLabel: "rate-limit-retry",
+        replyTo,
+        rawPrompt: true,
+        skipModelRouting: true,
+      });
       return;
     }
 
