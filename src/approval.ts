@@ -20,7 +20,47 @@
  *     parser. Caller decides whether to auto-dismiss (digit "0") or forward.
  */
 
-export type DialogKind = "permission" | "model-switch" | "survey" | "question";
+export type DialogKind = "permission" | "model-switch" | "survey" | "question" | "login";
+
+/**
+ * Claude Code's OAuth login step: after picking a login method it prints a
+ * long authorize URL (wrapped across pane lines) and waits for the operator
+ * to paste a code. Detected by the "Paste code here" / "Browser didn't open"
+ * wording; the wrapped URL is reconstructed by joining the unindented
+ * continuation lines.
+ */
+export interface LoginPrompt {
+  url: string;
+}
+
+export function parseLoginPrompt(pane: string): LoginPrompt | null {
+  if (!/Paste code here|Browser didn't open/i.test(pane)) return null;
+  const lines = pane.split("\n");
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/https?:\/\/\S*oauth\/authorize/i.test(lines[i])) {
+      start = i;
+      break;
+    }
+  }
+  if (start < 0) return null;
+  const parts: string[] = [];
+  for (let i = start; i < lines.length; i++) {
+    const t = lines[i].replace(/\s+$/, "");
+    if (/paste code here|esc to cancel/i.test(t)) break;
+    if (t.trim() === "") break;
+    const m = t.match(/(https?:\/\/\S.*)$/);
+    parts.push(i === start && m ? m[1] : t.trim());
+  }
+  const url = parts.join("");
+  return /^https?:\/\//.test(url) ? { url } : null;
+}
+
+/** True when the session is logged out but hasn't opened the login flow yet
+ *  (expired token / "Please run /login"). The daemon can auto-run /login. */
+export function isLoggedOut(pane: string): boolean {
+  return /Please run \/login|OAuth (?:access )?token has expired|Invalid API key.*\/login/i.test(pane);
+}
 
 export interface PermissionDialog {
   kind: DialogKind;
@@ -99,9 +139,13 @@ function parseBlockDialog(pane: string): PermissionDialog | null {
 
   if (/Bypass Permissions mode/i.test(question)) return null;
 
-  // Classify based on question content. "Switch model?" gets its own kind
-  // so the operator UI can label it clearly instead of "Permission needed".
-  const kind: DialogKind = /Switch model\?/i.test(question) ? "model-switch" : "permission";
+  // Classify based on question content. "Switch model?" and the /login
+  // method picker get their own kinds so the daemon can handle them
+  // specially instead of treating them as generic permissions.
+  const kind: DialogKind =
+    /Switch model\?/i.test(question) ? "model-switch"
+    : /Select login method/i.test(question) ? "login"
+    : "permission";
 
   return {
     kind,

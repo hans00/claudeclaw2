@@ -1215,6 +1215,9 @@ class Daemon {
       onApprovalNeeded: async (dialog, replyTo, api) => {
         await this.handleApprovalNeeded(session, dialog, replyTo, api);
       },
+      onLoginNeeded: async (url, replyTo) => {
+        await this.dispatchLoginPrompt(session, url, replyTo);
+      },
       onAssistantText: async (text, replyTo, claudeMsgId, stopReason) => {
         await this.dispatchAssistantText(session, text, replyTo, claudeMsgId, stopReason);
       },
@@ -1609,6 +1612,39 @@ class Daemon {
       chatId,
       "↩️ Denied. Reply with a reason or what to do instead — it'll be sent to the agent as your next message. Ignore to just stop.",
     ).catch(() => {});
+  }
+
+  /**
+   * Send the OAuth login URL to the operator so they can re-authenticate. The
+   * channel is now awaiting the auth code — the operator's next message on
+   * this chat gets typed straight into the tmux login prompt.
+   */
+  private async dispatchLoginPrompt(
+    session: ChannelSession,
+    url: string,
+    replyTo: ReplyTarget,
+  ): Promise<void> {
+    let chatId: number | undefined;
+    if (replyTo?.platform === "telegram") chatId = replyTo.chatId;
+    else if (this.settings.telegram.allowedUserIds.length > 0) chatId = this.settings.telegram.allowedUserIds[0];
+    if (chatId === undefined || !this.telegram) {
+      console.warn(`[login] no Telegram operator configured for ${session.channelKey} — cannot forward login URL`);
+      return;
+    }
+    // Plain text (no markdown) — the URL has underscores/percent-encoding that
+    // would break MarkdownV2. Telegram auto-links a bare URL on its own line.
+    const body = [
+      `🔑 ${session.channelKey} needs re-login (auth token expired).`,
+      "",
+      "1. Open this URL, approve, and copy the code:",
+      url,
+      "",
+      "2. Reply here with the code — I'll paste it in for you.",
+    ].join("\n");
+    await this.telegram.sendMessage(chatId, body).catch((err) =>
+      console.error(`[login] failed to send URL to ${session.channelKey}:`, err),
+    );
+    console.log(`[login] forwarded OAuth URL for ${session.channelKey} to chat ${chatId}`);
   }
 
   /**

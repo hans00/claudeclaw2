@@ -13,7 +13,7 @@ import { mkdir, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
 import type { AgenticConfig, QueueConfig } from "./config";
-import { parseModelPicker, parsePermissionDialog, type ModelPickerOption, type PermissionDialog } from "./approval";
+import { isLoggedOut, parseLoginPrompt, parseModelPicker, parsePermissionDialog, type ModelPickerOption, type PermissionDialog } from "./approval";
 import { buildClaudeArgs, type SecurityConfig } from "./compose";
 import { drainInbox, formatInboxForPrompt } from "./inbox";
 import { type JsonlEvent, tailJsonl, type TailHandle } from "./jsonl";
@@ -80,6 +80,10 @@ export interface ChannelCallbacks {
     replyTo: ReplyTarget,
     api: ApprovalApi,
   ): Promise<void> | void;
+  /** Optional: the session needs re-login and Claude Code is showing an OAuth
+   *  authorize URL. Daemon should send the URL to the operator and instruct
+   *  them to reply with the code (which the channel types back into tmux). */
+  onLoginNeeded?(url: string, replyTo: ReplyTarget): Promise<void> | void;
 }
 
 export interface ApprovalApi {
@@ -128,6 +132,8 @@ const MODEL_ECHO_TIMEOUT_MS = 3_000;
  *  which doubles as backoff; after this we give up and return to idle so the
  *  operator can retry manually. */
 const MAX_RATE_LIMIT_RETRIES = 3;
+/** How often to scan for the logged-out / OAuth-login state (always-on). */
+const LOGIN_CHECK_MS = 20_000;
 
 export interface SourceInfo {
   platform: "telegram" | "discord" | "slack" | "line";
@@ -356,6 +362,18 @@ export class Channel {
    *  on the current turn. Bounded by MAX_RATE_LIMIT_RETRIES; reset to 0 the
    *  moment the agent produces any assistant output (the error cleared). */
   private rateLimitRetries = 0;
+  /** Always-on watcher for the logged-out / OAuth-login state (see
+   *  checkLoginState). Runs regardless of turn state, since auth can expire
+   *  and leave the login prompt sitting while the channel is idle. */
+  private loginCheckTimer: ReturnType<typeof setInterval> | null = null;
+  /** True while we've forwarded a login URL and are waiting for the operator
+   *  to reply with the auth code (which we type into tmux). */
+  private awaitingLoginCode = false;
+  /** The login URL we last forwarded — dedup so we don't re-send every poll.
+   *  A new OAuth attempt has a different state/challenge, so it re-forwards. */
+  private loginUrlSent: string | null = null;
+  /** Dedup for auto-running `/login` on a bare logged-out pane. */
+  private loginTriggered = false;
   /**
    * Fires a synthetic turn-end after a permission denial. When the operator
    * (or anyone) rejects a tool, Claude Code records the rejection and — if it
@@ -463,6 +481,7 @@ export class Channel {
     }
 
     this.startTailing();
+    this.startLoginCheck();
 
     const result = await waitForReady({ target });
     if (result.status !== "ready") {
@@ -471,6 +490,91 @@ export class Channel {
     }
     this.state = "idle";
     void this.drainQueue();
+  }
+
+  /** Always-on watcher for the logged-out / OAuth-login state. */
+  private startLoginCheck(): void {
+    if (this.loginCheckTimer) return;
+    this.loginCheckTimer = setInterval(() => void this.checkLoginState(), LOGIN_CHECK_MS);
+  }
+
+  private stopLoginCheck(): void {
+    if (this.loginCheckTimer) clearInterval(this.loginCheckTimer);
+    this.loginCheckTimer = null;
+  }
+
+  /**
+   * Handle Claude Code's auth/login flow so an expired token doesn't leave the
+   * channel dead. Runs on a timer regardless of turn state (auth can expire
+   * and orphan the login prompt while idle). Three stages, most-specific
+   * first:
+   *   1. OAuth URL step → forward the URL to the operator, await the code.
+   *   2. "Select login method" picker → auto-pick subscription (option 1);
+   *      the approval poll skips kind "login" so we own it here (works even
+   *      when idle, where the poll doesn't run).
+   *   3. bare logged-out pane ("Please run /login") → auto-run /login.
+   */
+  private async checkLoginState(): Promise<void> {
+    let pane: string;
+    try {
+      pane = await capturePane(this.opts.session.tmuxSession);
+    } catch {
+      return;
+    }
+    const target = this.opts.session.tmuxSession;
+
+    // 1. OAuth URL + "Paste code here" step.
+    const login = parseLoginPrompt(pane);
+    if (login) {
+      this.loginTriggered = false;
+      if (this.loginUrlSent !== login.url) {
+        this.loginUrlSent = login.url;
+        this.awaitingLoginCode = true;
+        console.warn(`[channel ${this.opts.session.channelKey}] login required — forwarding OAuth URL to operator`);
+        void this.opts.callbacks.onLoginNeeded?.(login.url, this.currentTurnReplyTo);
+      }
+      return;
+    }
+
+    // 2. Login-method picker → auto-pick subscription (cursor is on option 1).
+    const dialog = parsePermissionDialog(pane);
+    if (dialog?.kind === "login") {
+      console.log(`[channel ${this.opts.session.channelKey}] login method picker — auto-selecting subscription`);
+      await pressEnter(target);
+      return;
+    }
+
+    // 3. Bare logged-out pane — kick off /login once.
+    if (isLoggedOut(pane)) {
+      if (!this.loginTriggered) {
+        this.loginTriggered = true;
+        console.warn(`[channel ${this.opts.session.channelKey}] session logged out — auto-running /login`);
+        await pasteText(target, "/login");
+        await new Promise((r) => setTimeout(r, 150));
+        await pressEnter(target);
+      }
+      return;
+    }
+
+    // Pane is in a normal state — reset the one-shot guards.
+    this.loginTriggered = false;
+    if (!this.awaitingLoginCode) this.loginUrlSent = null;
+  }
+
+  /** Type the operator-supplied auth code into the tmux login prompt. */
+  private async submitLoginCode(code: string): Promise<void> {
+    const target = this.opts.session.tmuxSession;
+    try {
+      await pasteText(target, code.trim());
+      await new Promise((r) => setTimeout(r, 150));
+      await pressEnter(target);
+      console.log(`[channel ${this.opts.session.channelKey}] submitted login code`);
+    } catch (err) {
+      console.error(`[channel ${this.opts.session.channelKey}] submitLoginCode failed:`, err);
+    }
+    this.awaitingLoginCode = false;
+    this.loginUrlSent = null;
+    this.loginTriggered = false;
   }
 
   private handleInitFailure(result: InitWatchResult): void {
@@ -628,6 +732,9 @@ export class Channel {
       this.activeApprovalFp = null;
       return;
     }
+    // Login flow (method picker / OAuth) is owned by checkLoginState, which
+    // runs regardless of turn state. Don't also handle it here.
+    if (dialog.kind === "login") return;
     // "Switch model?" confirmations are system decisions, never the operator's
     // — always proceed. If maybeSwitchModel is mid-switch (expectingModelEcho)
     // it owns the confirm, so leave it alone; otherwise auto-confirm here
@@ -892,6 +999,12 @@ export class Channel {
   /** Inbound message from the platform connector. */
   async handleIncoming(item: QueueItem): Promise<void> {
     item.receivedAt = new Date();
+    // While we're waiting on an auth code, the operator's next message IS the
+    // code — type it into the login prompt instead of pasting it as a prompt.
+    if (this.awaitingLoginCode) {
+      await this.submitLoginCode(item.text);
+      return;
+    }
     if (this.state === "idle") {
       await this.paste(item);
       return;
@@ -1439,6 +1552,7 @@ export class Channel {
     this.clearStallTimer();
     this.stopTypingPulse();
     this.stopApprovalPoll();
+    this.stopLoginCheck();
     try {
       await killSession(this.opts.session.tmuxSession);
     } catch {}
