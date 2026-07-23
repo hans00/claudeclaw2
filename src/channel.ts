@@ -13,7 +13,7 @@ import { mkdir, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
 import type { AgenticConfig, QueueConfig } from "./config";
-import { isLoggedOut, parseLoginPrompt, parseModelPicker, parsePermissionDialog, type ModelPickerOption, type PermissionDialog } from "./approval";
+import { hasReadyPrompt, isLoggedOut, parseLoginPrompt, parseModelPicker, parsePermissionDialog, type ModelPickerOption, type PermissionDialog } from "./approval";
 import { buildClaudeArgs, type SecurityConfig } from "./compose";
 import { drainInbox, formatInboxForPrompt } from "./inbox";
 import { type JsonlEvent, tailJsonl, type TailHandle } from "./jsonl";
@@ -522,6 +522,17 @@ export class Channel {
       return;
     }
     const target = this.opts.session.tmuxSession;
+
+    // Authed & interactive (the bordered ❯ box is up) → any login text is
+    // stale scrollback. Clear all login guards and bail, so we never
+    // false-trigger /login on a working session or leave awaitingLoginCode
+    // dangling (which would swallow a real message as a "code").
+    if (hasReadyPrompt(pane)) {
+      this.loginTriggered = false;
+      this.loginUrlSent = null;
+      this.awaitingLoginCode = false;
+      return;
+    }
 
     // 1. OAuth URL + "Paste code here" step.
     const login = parseLoginPrompt(pane);

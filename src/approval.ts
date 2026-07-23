@@ -33,19 +33,37 @@ export interface LoginPrompt {
   url: string;
 }
 
+/** The bordered `❯` input box only renders on an authed, interactive session
+ *  (never during the login flow). Its presence means any login text elsewhere
+ *  in the pane is stale scrollback — a strong "we're authed" signal. */
+const READY_INPUT_BOX_RE = /─{20,}[ \t]*\n[ \t]*❯[^\n]*\n[ \t]*─{20,}/;
+export function hasReadyPrompt(pane: string): boolean {
+  return READY_INPUT_BOX_RE.test(pane);
+}
+
+/** How many trailing lines count as the pane's "active" region. Login state
+ *  must be here — matching stale login text up in scrollback caused false
+ *  auto-/login loops on already-authed sessions. */
+const ACTIVE_TAIL_LINES = 16;
+
 export function parseLoginPrompt(pane: string): LoginPrompt | null {
-  if (!/Paste code here|Browser didn't open/i.test(pane)) return null;
+  // Authed box present → whatever login text exists is scrollback. Bail.
+  if (hasReadyPrompt(pane)) return null;
   const lines = pane.split("\n");
+  // "Paste code here" must be in the active (bottom) region to be live.
+  let pasteIdx = -1;
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - ACTIVE_TAIL_LINES); i--) {
+    if (/Paste code here|Browser didn't open/i.test(lines[i])) { pasteIdx = i; break; }
+  }
+  if (pasteIdx < 0) return null;
+  // Find the authorize URL just above the paste prompt.
   let start = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (/https?:\/\/\S*oauth\/authorize/i.test(lines[i])) {
-      start = i;
-      break;
-    }
+  for (let i = pasteIdx; i >= 0 && i > pasteIdx - 12; i--) {
+    if (/https?:\/\/\S*oauth\/authorize/i.test(lines[i])) { start = i; break; }
   }
   if (start < 0) return null;
   const parts: string[] = [];
-  for (let i = start; i < lines.length; i++) {
+  for (let i = start; i <= pasteIdx; i++) {
     const t = lines[i].replace(/\s+$/, "");
     if (/paste code here|esc to cancel/i.test(t)) break;
     if (t.trim() === "") break;
@@ -57,9 +75,13 @@ export function parseLoginPrompt(pane: string): LoginPrompt | null {
 }
 
 /** True when the session is logged out but hasn't opened the login flow yet
- *  (expired token / "Please run /login"). The daemon can auto-run /login. */
+ *  (expired token / "Please run /login") — checked only in the active bottom
+ *  region so stale scrollback doesn't re-trigger. The daemon can auto-run
+ *  /login. */
 export function isLoggedOut(pane: string): boolean {
-  return /Please run \/login|OAuth (?:access )?token has expired|Invalid API key.*\/login/i.test(pane);
+  if (hasReadyPrompt(pane)) return false;
+  const tail = pane.split("\n").slice(-ACTIVE_TAIL_LINES).join("\n");
+  return /Please run \/login|OAuth (?:access )?token has expired|Invalid API key.*\/login/i.test(tail);
 }
 
 export interface PermissionDialog {
